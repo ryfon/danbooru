@@ -41,7 +41,6 @@ class Post < ActiveRecord::Base
   has_one :pixiv_ugoira_frame_data, :class_name => "PixivUgoiraFrameData", :dependent => :destroy
   has_many :flags, :class_name => "PostFlag", :dependent => :destroy
   has_many :appeals, :class_name => "PostAppeal", :dependent => :destroy
-  has_many :versions, lambda {order("post_versions.updated_at ASC, post_versions.id ASC")}, :class_name => "PostVersion", :dependent => :destroy
   has_many :votes, :class_name => "PostVote", :dependent => :destroy
   has_many :notes, :dependent => :destroy
   has_many :comments, lambda {includes(:creator, :updater).order("comments.id")}, :dependent => :destroy
@@ -1419,12 +1418,12 @@ class Post < ActiveRecord::Base
   end
 
   module VersionMethods
+    def versions
+      PostArchive.where(post_id: id).order("post_versions.version ASC")
+    end
+
     def create_version(force = false)
       if new_record? || rating_changed? || source_changed? || parent_id_changed? || tag_string_changed? || force
-        if merge_version?
-          delete_previous_version
-        end
-
         create_new_version
       end
     end
@@ -1436,17 +1435,13 @@ class Post < ActiveRecord::Base
 
     def create_new_version
       CurrentUser.user.increment!(:post_update_count)
-      versions.create(
+      PostArchive.create(
+        :post_id => id,
         :rating => rating,
         :source => source,
         :tags => tag_string,
         :parent_id => parent_id
       )
-    end
-
-    def delete_previous_version
-      prev = versions.last
-      prev.destroy
     end
 
     def revert_to(target)

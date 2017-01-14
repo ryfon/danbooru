@@ -1,8 +1,12 @@
 require 'test_helper'
+require 'helpers/post_archive_test_helper'
 
 class PostVersionTest < ActiveSupport::TestCase
+  include PostArchiveTestHelper
+
   context "A post" do
     setup do
+      start_post_archive_transaction
       Timecop.travel(1.month.ago) do
         @user = FactoryGirl.create(:user)
       end
@@ -12,6 +16,7 @@ class PostVersionTest < ActiveSupport::TestCase
     end
 
     teardown do
+      rollback_post_archive_transaction
       CurrentUser.user = nil
       CurrentUser.ip_addr = nil
     end
@@ -27,18 +32,12 @@ class PostVersionTest < ActiveSupport::TestCase
 
       context "a version record" do
         setup do
-          @version = PostVersion.last
+          @version = PostArchive.last
         end
 
         should "know its previous version" do
           assert_not_nil(@version.previous)
           assert_equal("1 2", @version.previous.tags)
-        end
-
-        should "know the seuqence of all versions for the post" do
-          assert_equal(2, @version.sequence_for_post.size)
-          assert_equal(%w(3), @version.sequence_for_post[0][:added_tags])
-          assert_equal(%w(2), @version.sequence_for_post[1][:added_tags])
         end
       end
     end
@@ -75,13 +74,13 @@ class PostVersionTest < ActiveSupport::TestCase
 
     context "that has been updated" do
       setup do
-        @parent = FactoryGirl.create(:post)
         @post = FactoryGirl.create(:post, :tag_string => "aaa bbb ccc", :rating => "q", :source => "xyz")
         @post.stubs(:merge_version?).returns(false)
         @post.update_attributes(:tag_string => "bbb ccc xxx", :source => "")
       end
 
-      should "also create a version" do
+      should "1234 also create a version" do
+        binding.pry
         assert_equal(2, @post.versions.size)
         @version = @post.versions.last
         assert_equal("bbb ccc xxx", @version.tags)
