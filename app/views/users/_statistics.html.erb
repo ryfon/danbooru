@@ -147,6 +147,15 @@
 
       <% if CurrentUser.user.id == user.id %>
         <tr>
+          <th>Saved Searches</th>
+          <td>
+            <% SavedSearch.categories_for(CurrentUser.user).each do |category| %>
+              <p><%= link_to category, posts_path(tags: "search:#{category}") %></p>
+            <% end %>
+          </td>
+        </tr>
+
+        <tr>
           <th>API Key</th>
           <td>
             <%= link_to (CurrentUser.api_key ? "View" : "Generate"), user_api_key_path(CurrentUser.user) %>
