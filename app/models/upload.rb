@@ -104,8 +104,8 @@ class Upload < ApplicationRecord
 
     def validate_video_duration
       unless uploader.is_admin?
-        if is_video? && video.duration > 120
-          raise "video must not be longer than 2 minutes"
+        if is_video? && video.duration > 2700
+          raise "video must not be longer than 45 minutes"
         end
       end
     end
