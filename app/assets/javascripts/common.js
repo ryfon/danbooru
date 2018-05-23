@@ -28,6 +28,22 @@ $(function() {
     $('#notice').fadeOut("fast");
     e.preventDefault();
   });
+
+  $("#desktop-version-link a").click(function(e) {
+    e.preventDefault();
+    $.ajax("/users/" + Danbooru.meta("current-user-id") + ".json", {
+      method: "PUT",
+      data: {
+        "user[disable_responsive_mode]": "true"
+      }
+    }).then(function() {
+      location.reload();
+    });
+  });
 });
 
 var Danbooru = {};
+
+var submitInvisibleRecaptchaForm = function () {
+  document.getElementById("signup-form").submit();
+};

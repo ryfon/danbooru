@@ -1,6 +1,18 @@
-require 'danbooru_image_resizer/danbooru_image_resizer'
-
 namespace :images do
+  desc "Distribute posts to all servers via SFTP"
+  task :distribute, [:min_id, :max_id] => :environment do |t, args|
+    min_id = args[:min_id]
+    max_id = args[:max_id]
+    lsm = StorageManager::Local.new(base_url: "https://danbooru.donmai.us/data", base_dir: "/var/www/danbooru2/shared/data", hierarchical: false)
+    sftpsm = StorageManager::SFTP.new(*Danbooru.config.all_server_hosts, base_url: "https://danbooru.donmai.us/data")
+
+    Post.where("id between ? and ?", min_id, max_id).find_each do |post|
+      sftpsm.store_file(lsm.open_file(post, :original), post, :original)
+      sftpsm.store_file(lsm.open_file(post, :large), post, :large) if post.has_large?
+      sftpsm.store_file(lsm.open_file(post, :preview), post, :preview) if post.has_preview?
+    end
+  end
+
   desc "Reset S3 + Storage Class"
   task :reset_s3, [:min_id, :max_id] => :environment do |t, args|
     min_id = args[:min_id] # 1
@@ -92,7 +104,7 @@ namespace :images do
     post_id = ENV["id"]
 
     if post_id !~ /\d+/
-      raise "Usage: regen_img.rb POST_ID"
+      raise "Usage: regen id=n"
     end
 
     post = Post.find(post_id)
@@ -107,20 +119,33 @@ namespace :images do
     
   desc "Generate thumbnail-sized images of posts"
   task :generate_preview => :environment do
-    Post.where("image_width > ?", Danbooru.config.small_image_width).find_each do |post|
-      if post.is_image? && !File.exists?(post.preview_file_path)
+    width = 150
+    post_id = ENV["id"]
+
+    if post_id !~ /\d+/
+      raise "Usage: generate_preview id=n"
+    end
+
+    Post.where(id: post_id).find_each do |post|
+      if post.is_image?
         puts "resizing preview #{post.id}"
-        Danbooru.resize(post.file_path, post.preview_file_path, Danbooru.config.small_image_width, Danbooru.config.small_image_width, 90)
+        DanbooruImageResizer.resize(post.file_path, post.preview_file_path, width, width, 90)
       end
     end
   end
   
   desc "Generate large-sized images of posts"
   task :generate_large => :environment do
-    Post.where("image_width > ?", Danbooru.config.large_image_width).find_each do |post|
-      if post.is_image? && !File.exists?(post.large_file_path)
+    post_id = ENV["id"]
+
+    if post_id !~ /\d+/
+      raise "Usage: generate_large id=n"
+    end
+
+    Post.where(id: post_id).find_each do |post|
+      if post.is_image? && post.has_large?
         puts "resizing large #{post.id}"
-        Danbooru.resize(post.file_path, post.large_file_path, Danbooru.config.large_image_width, nil, 90)
+        DanbooruImageResizer.resize(post.file_path, post.large_file_path, Danbooru.config.large_image_width, nil, 90)
         post.distribute_files
       end
     end

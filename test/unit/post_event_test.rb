@@ -5,11 +5,11 @@ class PostEventTest < ActiveSupport::TestCase
     super
 
     Timecop.travel(2.weeks.ago) do
-      CurrentUser.user = FactoryGirl.create(:user)
+      CurrentUser.user = FactoryBot.create(:user)
       CurrentUser.ip_addr = "127.0.0.1"
     end
 
-    @post = FactoryGirl.create(:post)
+    @post = FactoryBot.create(:post)
     @post_flag = PostFlag.create(:post => @post, :reason => "aaa", :is_resolved => false)
     @post_appeal = PostAppeal.create(:post => @post, :reason => "aaa")
   end
@@ -24,8 +24,8 @@ class PostEventTest < ActiveSupport::TestCase
     should "work" do
       results = PostEvent.find_for_post(@post.id)
       assert_equal(2, results.size)
-      assert(results[0].flag?)
-      assert(results[1].appeal?)
+      assert_equal("appeal", results[0].type_name)
+      assert_equal("flag", results[1].type_name)
     end
   end
 end

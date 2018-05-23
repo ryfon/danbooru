@@ -8,4 +8,10 @@
   <% if CurrentUser.user.enable_post_navigation %>
     &ndash; <%= link_to "Keyboard shortcuts available", keyboard_shortcuts_path %>
   <% end %>
+  <% if CurrentUser.is_member? %>
+    <span id="desktop-version-link">
+      &ndash;
+      <%= link_to "Disable responsive mode", edit_user_path(CurrentUser.id), :rel => "nofollow" %>
+    </span>
+  <% end %>
 </footer>

@@ -1,7 +1,6 @@
-class ArtistVersion < ActiveRecord::Base
-  belongs_to :updater, :class_name => "User"
+class ArtistVersion < ApplicationRecord
+  belongs_to_updater
   belongs_to :artist
-  attr_accessible :artist_id, :name, :is_active, :other_names, :group_name, :url_string, :is_banned, :updater_id, :updater_ip_addr
   delegate :visible?, :to => :artist
 
   module SearchMethods
@@ -14,8 +13,7 @@ class ArtistVersion < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:name].present?
         q = q.where("name like ? escape E'\\\\'", params[:name].to_escaped_for_sql_like)
@@ -26,30 +24,21 @@ class ArtistVersion < ActiveRecord::Base
       end
 
       if params[:updater_id].present?
-        q = q.for_user(params[:updater_id].to_i)
+        q = q.where(updater_id: params[:updater_id].split(",").map(&:to_i))
       end
 
       if params[:artist_id].present?
-        q = q.where("artist_id = ?", params[:artist_id].to_i)
+        q = q.where(artist_id: params[:artist_id].split(",").map(&:to_i))
       end
+
+      q = q.attribute_matches(:is_active, params[:is_active])
+      q = q.attribute_matches(:is_banned, params[:is_banned])
 
       params[:order] ||= params.delete(:sort)
       if params[:order] == "name"
-        q = q.reorder("name")
+        q = q.order("artist_versions.name").default_order
       else
-        q = q.reorder("id desc")
-      end
-
-      if params[:is_active] == "true"
-        q = q.where("is_active = true")
-      elsif params[:is_active] == "false"
-        q = q.where("is_active = false")
-      end
-
-      if params[:is_banned] == "true"
-        q = q.where("is_banned = true")
-      elsif params[:is_banned] == "false"
-        q = q.where("is_banned = false")
+        q = q.apply_default_order(params)
       end
 
       q
@@ -106,9 +95,5 @@ class ArtistVersion < ActiveRecord::Base
 
   def previous
     ArtistVersion.where("artist_id = ? and created_at < ?", artist_id, created_at).order("created_at desc").first
-  end
-
-  def updater_name
-    User.id_to_name(updater_id).tr("_", " ")
   end
 end

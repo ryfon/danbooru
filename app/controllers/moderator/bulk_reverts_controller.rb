@@ -1,7 +1,7 @@
 module Moderator
   class BulkRevertsController < ApplicationController
-    before_filter :moderator_only
-    before_filter :init_constraints
+    before_action :moderator_only
+    before_action :init_constraints
     helper PostVersionsHelper
     rescue_from BulkRevert::ConstraintTooGeneralError, :with => :tag_constraint_too_general
 
@@ -9,15 +9,15 @@ module Moderator
     end
 
     def create
-      @bulk_revert = BulkRevert.new(@constraints)
+      @bulk_revert = BulkRevert.new
 
       if params[:commit] == "Test"
         @bulk_revert.preview
         render action: "new"
       else
-        BulkRevert.delay(:queue => "default").process(@constraints)
+        @bulk_revert.delay(:queue => "default", :priority => 15).process(CurrentUser.user, @constraints)
         flash[:notice] = "Reverts queued"
-        redirect_to new_bulk_revert_path
+        redirect_to new_moderator_bulk_revert_path
       end
     end
 

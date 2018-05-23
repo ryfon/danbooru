@@ -1,7 +1,7 @@
 class FavoritesController < ApplicationController
-  before_filter :member_only
+  before_action :member_only, except: [:index]
   respond_to :html, :xml, :json
-  skip_before_filter :api_check
+  skip_before_action :api_check
 
   def index
     if params[:tags]
@@ -32,9 +32,6 @@ class FavoritesController < ApplicationController
     end
 
     respond_with(@post) do |format|
-      format.html do
-        redirect_to(mobile_post_path(@post))
-      end
       format.js
       format.json do
         if @post
@@ -47,13 +44,15 @@ class FavoritesController < ApplicationController
   end
 
   def destroy
-    @post = Post.find(params[:id])
-    @post.remove_favorite!(CurrentUser.user)
+    @post = Post.find_by_id(params[:id])
+
+    if @post
+      @post.remove_favorite!(CurrentUser.user)
+    else
+      Favorite.remove(post_id: params[:id], user: CurrentUser.user)
+    end
 
     respond_with(@post) do |format|
-      format.html do
-        redirect_to(mobile_post_path(@post))
-      end
       format.js
       format.json do
         render :json => {:success => true}.to_json

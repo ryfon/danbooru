@@ -1,22 +1,31 @@
-class Ban < ActiveRecord::Base
-  after_create :update_feedback
+class Ban < ApplicationRecord
+  after_create :create_feedback
   after_create :update_user_on_create
   after_create :create_mod_action
   after_destroy :update_user_on_destroy
   belongs_to :user
   belongs_to :banner, :class_name => "User"
-  attr_accessible :reason, :duration, :user_id, :user_name
   validate :user_is_inferior
   validates_presence_of :user_id, :reason, :duration
   before_validation :initialize_banner_id, :on => :create
+
+  scope :unexpired, -> { where("bans.expires_at > ?", Time.now) }
+  scope :expired, -> { where("bans.expires_at <= ?", Time.now) }
 
   def self.is_banned?(user)
     exists?(["user_id = ? AND expires_at > ?", user.id, Time.now])
   end
 
+  def self.reason_matches(query)
+    if query =~ /\*/
+      where("lower(bans.reason) LIKE ?", query.mb_chars.downcase.to_escaped_for_sql_like)
+    else
+      where("bans.reason @@ plainto_tsquery(?)", query)
+    end
+  end
+
   def self.search(params)
-    q = where("true")
-    return q if params.blank?
+    q = super
 
     if params[:banner_name]
       q = q.where("banner_id = (select _.id from users _ where lower(_.name) = ?)", params[:banner_name].mb_chars.downcase)
@@ -32,6 +41,20 @@ class Ban < ActiveRecord::Base
 
     if params[:user_id]
       q = q.where("user_id = ?", params[:user_id].to_i)
+    end
+
+    if params[:reason_matches].present?
+      q = q.reason_matches(params[:reason_matches])
+    end
+
+    q = q.expired if params[:expired].to_s.truthy?
+    q = q.unexpired if params[:expired].to_s.falsy?
+
+    case params[:order]
+    when "expires_at_desc"
+      q = q.order("bans.expires_at desc")
+    else
+      q = q.apply_default_order(params)
     end
 
     q
@@ -60,16 +83,6 @@ class Ban < ActiveRecord::Base
     end
   end
 
-  def update_feedback
-    if user
-      feedback = user.feedback.build
-      feedback.category = "negative"
-      feedback.body = "Banned: #{reason}"
-      feedback.creator_id = banner_id
-      feedback.save
-    end
-  end
-
   def update_user_on_create
     user.update_attribute(:is_banned, true)
   end
@@ -95,11 +108,19 @@ class Ban < ActiveRecord::Base
     @duration
   end
 
+  def humanized_duration
+    ApplicationController.helpers.distance_of_time_in_words(created_at, expires_at)
+  end
+
   def expired?
     expires_at < Time.now
   end
 
+  def create_feedback
+    user.feedback.create(category: "negative", body: "Banned for #{humanized_duration}: #{reason}")
+  end
+
   def create_mod_action
-    ModAction.log(%{Banned "#{user_name}":/users/#{user_id} until #{expires_at}})
+    ModAction.log(%{Banned <@#{user_name}> for #{humanized_duration}: #{reason}},:user_ban)
   end
 end

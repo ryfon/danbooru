@@ -11,28 +11,33 @@ class SessionLoader
   end
 
   def load
-    if session[:user_id]
+    CurrentUser.user = AnonymousUser.new
+    CurrentUser.ip_addr = request.remote_ip
+
+    if Rails.env.test? && Thread.current[:test_user_id]
+      load_for_test(Thread.current[:test_user_id])
+    elsif session[:user_id]
       load_session_user
     elsif cookie_password_hash_valid?
       load_cookie_user
     else
       load_session_for_api
     end
-    
-    if CurrentUser.user
-      CurrentUser.user.unban! if ban_expired?
-    else
-      CurrentUser.user = AnonymousUser.new
-    end
 
+    set_statement_timeout
     update_last_logged_in_at
     update_last_ip_addr
     set_time_zone
     store_favorite_tags_in_cookies
-    set_statement_timeout
+    CurrentUser.user.unban! if CurrentUser.user.ban_expired?
   end
 
 private
+
+  def load_for_test(user_id)
+    CurrentUser.user = User.find(user_id)
+    CurrentUser.ip_addr = "127.0.0.1"
+  end
   
   def set_statement_timeout
     timeout = CurrentUser.user.statement_timeout
@@ -58,7 +63,6 @@ private
   end
   
   def authenticate_api_key(name, api_key)
-    CurrentUser.ip_addr = request.remote_ip
     CurrentUser.user = User.authenticate_api_key(name, api_key)
 
     if CurrentUser.user.nil?
@@ -67,7 +71,6 @@ private
   end
   
   def authenticate_legacy_api_key(name, password_hash)
-    CurrentUser.ip_addr = request.remote_ip
     CurrentUser.user = User.authenticate_hash(name, password_hash)
 
     if CurrentUser.user.nil?
@@ -76,18 +79,13 @@ private
   end
 
   def load_session_user
-    CurrentUser.ip_addr = request.remote_ip
-    CurrentUser.user = User.find_by_id(session[:user_id])
+    user = User.find_by_id(session[:user_id])
+    CurrentUser.user = user if user
   end
 
   def load_cookie_user
     CurrentUser.user = User.find_by_name(cookies.signed[:user_name])
-    CurrentUser.ip_addr = request.remote_ip
     session[:user_id] = CurrentUser.user.id
-  end
-
-  def ban_expired?
-    CurrentUser.user.is_banned? && CurrentUser.user.recent_ban && CurrentUser.user.recent_ban.expired?
   end
 
   def cookie_password_hash_valid?
@@ -106,19 +104,12 @@ private
     return if CurrentUser.is_anonymous?
     return if CurrentUser.last_logged_in_at && CurrentUser.last_logged_in_at > 1.week.ago
     CurrentUser.user.update_attribute(:last_logged_in_at, Time.now)
-    refresh_listbooru
   end
 
   def update_last_ip_addr
     return if CurrentUser.is_anonymous?
     return if CurrentUser.user.last_ip_addr == @request.remote_ip
     CurrentUser.user.update_attribute(:last_ip_addr, @request.remote_ip)
-  end
-
-  def refresh_listbooru
-    if CurrentUser.is_gold? && CurrentUser.has_saved_searches? && Danbooru.config.listbooru_server && CurrentUser.is_gold?
-      SavedSearch.refresh_listbooru(CurrentUser.id)
-    end
   end
 
   def set_time_zone

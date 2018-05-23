@@ -3,20 +3,20 @@ class DailyMaintenance
     ActiveRecord::Base.connection.execute("set statement_timeout = 0")
     PostPruner.new.prune!
     TagPruner.new.prune!
-    Upload.delete_all(['created_at < ?', 1.day.ago])
-    ModAction.delete_all(['created_at < ?', 3.days.ago])
-    Delayed::Job.delete_all(['created_at < ?', 7.days.ago])
+    Upload.where('created_at < ?', 1.day.ago).delete_all
+    Delayed::Job.where('created_at < ?', 45.days.ago).delete_all
+    #ForumPostVote.where("created_at < ?", 90.days.ago).delete_all
     PostVote.prune!
     CommentVote.prune!
-    #TagSubscription.process_all
     ApiCacheGenerator.new.generate_tag_cache
     PostDisapproval.prune!
     ForumSubscription.process_all!
     TagAlias.update_cached_post_counts_for_all
     PostDisapproval.dmail_messages!
     Tag.clean_up_negative_post_counts!
-    PostApproval.prune!
     SuperVoter.init!
     TokenBucket.prune!
+    TagChangeRequestPruner.warn_all
+    TagChangeRequestPruner.reject_all
   end
 end

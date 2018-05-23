@@ -1,19 +1,10 @@
-<% if SavedSearch.enabled? && CurrentUser.show_saved_searches? %>
-  <%= button_tag "Save search", :id => "save-search" %>
-<% end %>
-
 <% if SavedSearch.enabled? %>
   <div id="save-search-dialog" title="Save Search" style="display: none;">
-    <%= form_tag(saved_searches_path, :class => "simple_form", :remote => true) do %>
-      <%= hidden_field_tag "saved_search_tags", params[:tags] %>
 
-      <div class="input">
-        <label>
-          <%= text_field_tag "saved_search_category", "", :placeholder => "Category" %>
-        </label>
-      </div>
-
-      <p><label><%= check_box_tag "saved_search_disable_categories" %> Disable categorization</label></p>
+    <%= simple_form_for(SavedSearch.new, remote: true) do |f| %>
+      <%= f.input :query, as: :string, input_html: { value: params[:tags], data: { autocomplete: "tag-query" } } %>
+      <%= f.input :label_string, label: "Labels", hint: "A list of tags to help categorize this search. Space delimited." %>
+      <%= f.input :disable_labels, label: "Don't show this dialog again", as: :boolean %>
     <% end %>
   </div>
 <% end %>

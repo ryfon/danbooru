@@ -25,28 +25,47 @@
       <% if user.is_banned? && user.recent_ban %>
         <tr>
           <th>Ban reason</th>
-          <td><%= format_text presenter.ban_reason, :ragel => true %></td>
+          <td><%= format_text presenter.ban_reason %></td>
         </tr>
       <% end %>
 
       <tr>
         <th>Upload Limit</th>
-        <td><%= presenter.upload_limit %></td>
+        <td><%= presenter.upload_limit(self) %> (<%= link_to "help", wiki_pages_path(title: "about:upload_limits") %>)</td>
       </tr>
 
       <tr>
         <th>Uploads</th>
-        <td><%= presenter.upload_count(self) %></td>
+        <td>
+          <%= presenter.upload_count(self) %>
+          <% if presenter.has_uploads? %>
+            [<%= link_to "tag changes report", reports_upload_tags_path(user_id: user.id) %>]
+          <% end %>
+          <% if CurrentUser.is_moderator? %>
+            [<%= link_to "sample", posts_path(:tags => "user:#{user.name} order:random limit:300") %>]
+          <% end %>
+        </td>
       </tr>
 
       <tr>
         <th>Deleted Uploads</th>
-        <td><%= presenter.deleted_upload_count(self) %></td>
+        <td>
+          <%= presenter.deleted_upload_count(self) %>
+          <% if CurrentUser.is_moderator? %>
+            [<%= link_to "sample", posts_path(:tags => "user:#{user.name} order:random limit:300 status:deleted") %>]
+          <% end %>
+
+        </td>
       </tr>
 
       <tr>
         <th>Favorites</th>
-        <td><%= presenter.favorite_count(self) %></td>
+        <td>
+          <%= presenter.favorite_count(self) %>
+          <% if CurrentUser.is_moderator? %>
+            [<%= link_to "sample", posts_path(:tags => "fav:#{user.name} order:random limit:300") %>]
+          <% end %>
+        </td>
       </tr>
 
       <tr>
@@ -122,19 +141,6 @@
         <th>Feedback</th>
         <td><%= presenter.feedbacks(self) %></td>    </tbody>
       </tr>
-
-      <tr>
-        <th>Subscriptions</th>
-        <td>
-          <% presenter.subscriptions.each do |subscription| %>
-            <p>
-              <strong><%= link_to subscription.pretty_name, posts_path(:tags => "sub:#{user.name}:#{subscription.name}") %></strong>
-              &ndash;
-              <%= presenter.tag_links_for_subscription(self, subscription) %>
-            </p>
-          <% end %>
-        </td>
-      </tr>
       
       <% if presenter.previous_names(self).present? %>
         <tr>
@@ -148,8 +154,8 @@
           <tr>
             <th>Saved Searches</th>
             <td>
-              <% SavedSearch.categories_for(CurrentUser.user).each do |category| %>
-                <p><%= link_to category, posts_path(tags: "search:#{category}") %></p>
+              <% SavedSearch.labels_for(CurrentUser.user.id).each do |label| %>
+                <%= link_to label, posts_path(tags: "search:#{label}") %>
               <% end %>
             </td>
           </tr>

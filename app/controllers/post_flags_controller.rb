@@ -1,5 +1,5 @@
 class PostFlagsController < ApplicationController
-  before_filter :member_only, :except => [:index, :show]
+  before_action :member_only, :except => [:index, :show]
   respond_to :html, :xml, :json, :js
 
   def new
@@ -8,8 +8,8 @@ class PostFlagsController < ApplicationController
   end
 
   def index
-    @query = PostFlag.order("id desc").search(params[:search])
-    @post_flags = @query.paginate(params[:page], :limit => params[:limit])
+    @post_flags = PostFlag.search(search_params).includes(:creator, post: [:flags, :uploader, :approver])
+    @post_flags = @post_flags.paginate(params[:page], limit: params[:limit])
     respond_with(@post_flags) do |format|
       format.xml do
         render :xml => @post_flags.to_xml(:root => "post-flags")
@@ -18,7 +18,7 @@ class PostFlagsController < ApplicationController
   end
 
   def create
-    @post_flag = PostFlag.create(params[:post_flag].merge(:is_resolved => false))
+    @post_flag = PostFlag.create(post_flag_params)
     respond_with(@post_flag)
   end
 
@@ -27,8 +27,9 @@ class PostFlagsController < ApplicationController
     respond_with(@post_flag)
   end
 
-private
-  def check_privilege(post_flag)
-    raise User::PrivilegeError unless (post_flag.creator_id == CurrentUser.id || CurrentUser.is_moderator?)
+  private
+
+  def post_flag_params
+    params.require(:post_flag).permit(%i[post_id reason])
   end
 end

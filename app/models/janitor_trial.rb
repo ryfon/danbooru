@@ -1,17 +1,15 @@
-class JanitorTrial < ActiveRecord::Base
+class JanitorTrial < ApplicationRecord
   belongs_to :user
   after_create :send_dmail
   after_create :promote_user
   validates_presence_of :user
-  before_validation :initialize_creator
-  attr_accessible :user_id, :user_name
+  belongs_to_creator
   validates_inclusion_of :status, :in => %w(active inactive)
   before_validation :initialize_status
   validates_uniqueness_of :user_id
 
   def self.search(params)
-    q = where("status = ?", "active")
-    return q if params.blank?
+    q = super.where(status: "active")
 
     if params[:user_name]
       q = q.where("user_id = (select _.id from users _ where lower(_.name) = ?)", params[:user_name].mb_chars.downcase)
@@ -21,7 +19,7 @@ class JanitorTrial < ActiveRecord::Base
       q = q.where("user_id = ?", params[:user_id].to_i)
     end
 
-    q
+    q.apply_default_order(params)
   end
 
   def self.message_candidates!
@@ -58,10 +56,6 @@ class JanitorTrial < ActiveRecord::Base
     self.status = "active"
   end
 
-  def initialize_creator
-    self.creator_id = CurrentUser.id
-  end
-
   def user_name
     user.try(:name)
   end
@@ -71,7 +65,7 @@ class JanitorTrial < ActiveRecord::Base
   end
 
   def send_dmail
-    body = "You have been selected as a test janitor. You can now approve pending posts and have access to the moderation interface. You should reacquaint yourself with the [[howto:upload]] guide to make sure you understand the site rules.\n\nOver the next several weeks your approvals will be monitored. If the majority of them are not quality uploads you will fail the trial period and lose your approval privileges. You will also receive a negative user record indicating you previously attempted and failed a test janitor trial.\n\nThere is a minimum quota of 1 approval a month to indicate that you are being active. Remember, the goal isn't to approve as much as possible. It's to filter out borderline-quality art.\n\nIf you have any questions please respond to this message."
+    body = "You have been selected as a test janitor. You can now approve pending posts and have access to the moderation interface. You should reacquaint yourself with the [[howto:upload]] guide to make sure you understand the site rules.\n\nOver the next several weeks your approvals will be monitored. If the majority of them are not quality uploads you will fail the trial period and lose your approval privileges. You will also receive a negative user record indicating you previously attempted and failed a test janitor trial.\n\nThere is a minimum quota of 1 approval a month to indicate that you are being active. Remember, the goal isn't to approve as much as possible. It's to filter out borderline-quality art."
 
     Dmail.create_automated(:title => "Test Janitor Trial Period", :body => body, :to_id => user_id)
   end

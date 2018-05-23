@@ -1,20 +1,18 @@
-class UserFeedback < ActiveRecord::Base
+class UserFeedback < ApplicationRecord
   self.table_name = "user_feedback"
   belongs_to :user
-  belongs_to :creator, :class_name => "User"
-  before_validation :initialize_creator, :on => :create
-  attr_accessor :disable_dmail_notification
-  attr_accessible :body, :user_id, :category, :user_name, :disable_dmail_notification
+  belongs_to_creator
+  attribute :disable_dmail_notification, :boolean
   validates_presence_of :user, :creator, :body, :category
   validates_inclusion_of :category, :in => %w(positive negative neutral)
   validate :creator_is_gold
   validate :user_is_not_creator
   after_create :create_dmail
-  after_update(:if => lambda {|rec| CurrentUser.id != rec.creator_id}) do |rec|
-    ModAction.log(%{#{CurrentUser.name} updated user feedback for "#{rec.user_name}":/users/#{rec.user_id}})
+  after_update(:if => ->(rec) { CurrentUser.id != rec.creator_id}) do |rec|
+    ModAction.log(%{#{CurrentUser.name} updated user feedback for "#{rec.user_name}":/users/#{rec.user_id}},:user_feedback_update)
   end
-  after_destroy(:if => lambda {|rec| CurrentUser.id != rec.creator_id}) do |rec|
-    ModAction.log(%{#{CurrentUser.name} deleted user feedback for "#{rec.user_name}":/users/#{rec.user_id}})
+  after_destroy(:if => ->(rec) { CurrentUser.id != rec.creator_id}) do |rec|
+    ModAction.log(%{#{CurrentUser.name} deleted user feedback for "#{rec.user_name}":/users/#{rec.user_id}},:user_feedback_delete)
   end
 
   module SearchMethods
@@ -43,9 +41,12 @@ class UserFeedback < ActiveRecord::Base
       end
     end
 
+    def default_order
+      order(created_at: :desc)
+    end
+
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:user_id].present?
         q = q.for_user(params[:user_id].to_i)
@@ -67,22 +68,14 @@ class UserFeedback < ActiveRecord::Base
         q = q.where("category = ?", params[:category])
       end
 
-      q
+      q.apply_default_order(params)
     end
   end
 
   extend SearchMethods
 
-  def initialize_creator
-    self.creator_id = CurrentUser.id
-  end
-
   def user_name
     User.id_to_name(user_id)
-  end
-
-  def creator_name
-    User.id_to_name(creator_id)
   end
 
   def user_name=(name)
@@ -91,7 +84,7 @@ class UserFeedback < ActiveRecord::Base
 
   def create_dmail
     unless disable_dmail_notification
-      body = %{#{creator_name} created a "#{category} record":/user_feedbacks?search[user_id]=#{user_id} for your account. #{body}}
+      body = %{@#{creator_name} created a "#{category} record":/user_feedbacks?search[user_id]=#{user_id} for your account:\n\n#{self.body}}
       Dmail.create_automated(:to_id => user_id, :title => "Your user record has been updated", :body => body)
     end
   end

@@ -1,14 +1,35 @@
 <div id="c-uploads">
-  <div id="a-new">
+  <div id="a-batch">
     <h1>Batch Upload</h1>
 
-    <ul id="links">
-      <% @urls.each.with_index do |url, i| %>
-        <li><%= link_to "Image ##{i}", new_upload_path(:url => url, :ref => params[:url]), :target => "_blank" %></li>
-      <% end %>
-    </ul>
+    <%= simple_form_for(:batch, url: batch_uploads_path, method: :get, defaults: { required: false }, html: { class: "one-line-form" }) do |f| %>
+      <%= f.input :url, label: "URL", input_html: { size: 70, value: @url, placeholder: "https://www.pixiv.net/member_illust.php?mode=medium&illust_id=65981746" } %>
+      <%= f.submit "Fetch" %>
+    <% end %>
 
-    <p><%= link_to "Open all links in new windows", "#", :id => "link" %></p>
+    <% if @source.present? %>
+      <section>
+        <% @source.image_urls.each.with_index do |url, i| %>
+          <div class="upload-preview">
+            <p class="caption-top">
+              <%= link_to "Image ##{i}", new_upload_path(url: url, ref: @url), target: "_blank" %>
+            </p>
+
+            <%= link_to new_upload_path(url: url, ref: @url), target: "_blank" do %>
+              <% if ImageProxy.needs_proxy?(url) %>
+                <%= image_tag(image_proxy_uploads_path(url: url)) %>
+              <% elsif url.is_a?(String) %>
+                <%= image_tag url %>
+              <% else %>
+                Direct Link
+              <% end %>
+            <% end %>
+          </div>
+        <% end %>
+
+        <p><%= link_to "Open all links in new windows", "#", :id => "link" %></p>
+      </section>
+    <% end %>
   </div>
 </div>
 
@@ -20,7 +41,7 @@
   <script type="text/javascript">
     $(function() {
       $("#link").click(function() {
-        $("#links a").each(function(i, v) {
+        $(".upload-preview > a").each(function(i, v) {
           window.open(v.href);
         });
       });
@@ -28,4 +49,4 @@
   </script>
 <% end %>
 
-<%= render "posts/partials/common/secondary_links" %>
+<%= render "uploads/secondary_links" %>

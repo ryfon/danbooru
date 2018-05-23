@@ -1,13 +1,13 @@
 class SavedSearchesController < ApplicationController
-  include SavedSearches::CheckAvailability
-
-  before_filter :member_only
+  before_action :check_availability
   respond_to :html, :xml, :json, :js
   
   def index
-    @saved_searches = saved_searches.order("tag_query")
-    @categories = @saved_searches.group_by{|saved_search| saved_search.category.to_s}
-    @categories = @categories.sort_by{|category, saved_searches| category.to_s}
+    @saved_searches = saved_searches.order("id")
+
+    if params[:label]
+      @saved_searches = saved_searches.labeled(params[:label])
+    end
 
     respond_with(@saved_searches) do |format|
       format.xml do
@@ -16,18 +16,13 @@ class SavedSearchesController < ApplicationController
     end
   end
 
-  def categories
-    @categories = saved_searches.select(:category).distinct
-    respond_with(@categories)
+  def labels
+    @labels = SavedSearch.search_labels(CurrentUser.id, params[:search])
+    respond_with(@labels)
   end
 
   def create
-    @saved_search = saved_searches.create(:tag_query => params[:saved_search_tags], :category => params[:saved_search_category])
-
-    if params[:saved_search_disable_categories]
-      CurrentUser.disable_categorized_saved_searches = true
-      CurrentUser.save
-    end
+    @saved_search = saved_searches.create(saved_search_params)
     respond_with(@saved_search)
   end
 
@@ -43,12 +38,23 @@ class SavedSearchesController < ApplicationController
 
   def update
     @saved_search = saved_searches.find(params[:id])
-    @saved_search.update_attributes(params[:saved_search])
+    @saved_search.update(saved_search_params)
     respond_with(@saved_search, :location => saved_searches_path)
   end
 
-private
+  private
+
   def saved_searches
     CurrentUser.user.saved_searches
+  end
+
+  def check_availability
+    if !SavedSearch.enabled?
+      raise NotImplementedError.new("Listbooru service is not configured. Saved searches are not available.")
+    end
+  end
+
+  def saved_search_params
+    params.fetch(:saved_search, {}).permit(%i[query label_string disable_labels])
   end
 end

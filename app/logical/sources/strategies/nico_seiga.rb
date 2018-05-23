@@ -1,6 +1,8 @@
 module Sources
   module Strategies
     class NicoSeiga < Base
+      extend Memoist
+      
       def self.url_match?(url)
         url =~ /^https?:\/\/(?:\w+\.)?nico(?:seiga|video)\.jp/
       end
@@ -25,8 +27,9 @@ module Sources
       def get
         page = load_page
 
-        @artist_name, @profile_url = get_profile_from_page(page)
+        @artist_name, @profile_url = get_profile_from_api
         @image_url = get_image_url_from_page(page)
+        @artist_commentary_title, @artist_commentary_desc = get_artist_commentary_from_api
 
         # Log out before getting the tags.
         # The reason for this is that if you're logged in and viewing a non-adult-rated work, the tags will be added with javascript after the page has loaded meaning we can't extract them easily.
@@ -38,7 +41,7 @@ module Sources
       end
 
       def normalized_for_artist_finder?
-        url =~ %r!https?://seiga\.nicovideo\.jp/user/illust/\d+!i
+        url =~ %r!https?://seiga\.nicovideo\.jp/user/illust/\d+/!i
       end
 
       def normalizable_for_artist_finder?
@@ -47,11 +50,24 @@ module Sources
 
       def normalize_for_artist_finder!
         page = load_page
-        @artist_name, @profile_url = get_profile_from_page(page)
-        profile_url
+        @illust_id = get_illust_id_from_url
+        @artist_name, @profile_url = get_profile_from_api
+        @profile_url + "/"
       end
 
     protected
+
+      def api_client
+        NicoSeigaApiClient.new(get_illust_id_from_url)
+      end
+
+      def get_illust_id_from_url
+        if normalized_url =~ %r!http://seiga.nicovideo.jp/seiga/im(\d+)!
+          $1.to_i
+        else
+          nil
+        end
+      end
 
       def load_page
         page = agent.get(normalized_url)
@@ -66,18 +82,8 @@ module Sources
         page
       end
 
-      def get_profile_from_page(page)
-        links = page.search("li a").select {|x| x["href"] =~ /user\/illust/}
-
-        if links.any?
-          profile_url = "http://seiga.nicovideo.jp" + links[0]["href"]
-          artist_name = links[0].search("span")[0].children[0].text
-        else
-          profile_url = nil
-          artist_name = nil
-        end
-
-        return [artist_name, profile_url].compact
+      def get_profile_from_api
+        return [api_client.moniker, "http://seiga.nicovideo.jp/user/illust/#{api_client.user_id}"]
       end
 
       def get_image_url_from_page(page)
@@ -89,9 +95,9 @@ module Sources
           if page.is_a?(Mechanize::Image)
             return page.uri.to_s
           end
-          images = page.search("img").select {|x| x["src"] =~ /\/priv\//}
+          images = page.search("div.illust_view_big").select {|x| x["data-src"] =~ /\/priv\//}
           if images.any?
-            image_url = "http://lohas.nicoseiga.jp" + images[0]["src"]
+            image_url = "http://lohas.nicoseiga.jp" + images[0]["data-src"]
           end
         else
           image_url = nil
@@ -108,17 +114,21 @@ module Sources
         end
       end
 
+      def get_artist_commentary_from_api
+        [api_client.title, api_client.desc]
+      end
+
       def normalized_url
         @normalized_url ||= begin
-          if url =~ %r!\Ahttp://lohas\.nicoseiga\.jp/o/[a-f0-9]+/\d+/(\d+)!
+          if url =~ %r!\Ahttps?://lohas\.nicoseiga\.jp/o/[a-f0-9]+/\d+/(\d+)!
             "http://seiga.nicovideo.jp/seiga/im#{$1}"
-          elsif url =~ %r{\Ahttp://lohas\.nicoseiga\.jp/priv/(\d+)\?e=\d+&h=[a-f0-9]+}i
+          elsif url =~ %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/(\d+)\?e=\d+&h=[a-f0-9]+}i
             "http://seiga.nicovideo.jp/seiga/im#{$1}"
-          elsif url =~ %r{\Ahttp://lohas\.nicoseiga\.jp/priv/[a-f0-9]+/\d+/(\d+)}i
+          elsif url =~ %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/[a-f0-9]+/\d+/(\d+)}i
             "http://seiga.nicovideo.jp/seiga/im#{$1}"
-          elsif url =~ %r{\Ahttp://lohas\.nicoseiga\.jp/priv/(\d+)}i
+          elsif url =~ %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/(\d+)}i
             "http://seiga.nicovideo.jp/seiga/im#{$1}"
-          elsif url =~ %r{\Ahttp://lohas\.nicoseiga\.jp//?thumb/(\d+)}i
+          elsif url =~ %r{\Ahttps?://lohas\.nicoseiga\.jp//?thumb/(\d+)i?}i
             "http://seiga.nicovideo.jp/seiga/im#{$1}"
           elsif url =~ %r{/seiga/im\d+}
             url
@@ -131,6 +141,7 @@ module Sources
       def agent
         @agent ||= begin
           mech = Mechanize.new
+          mech.redirect_ok = false
           mech.keep_alive = false
 
           session = Cache.get("nico-seiga-session")
@@ -140,7 +151,7 @@ module Sources
             cookie.path = "/"
             mech.cookie_jar.add(cookie)
           else
-            mech.get("https://secure.nicovideo.jp/secure/login_form") do |page|
+            mech.get("https://account.nicovideo.jp/login") do |page|
               page.form_with(:id => "login_form") do |form|
                 form["mail_tel"] = Danbooru.config.nico_seiga_login
                 form["password"] = Danbooru.config.nico_seiga_password
@@ -160,9 +171,12 @@ module Sources
           cookie.path = "/"
           mech.cookie_jar.add(cookie)
 
+          mech.redirect_ok = true
           mech
         end
       end
+
+      memoize :api_client
     end
   end
 end

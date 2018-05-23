@@ -49,20 +49,14 @@ module ApplicationHelper
     raw %{<a href="#{h(url)}" #{attributes}>#{text}</a>}
   end
 
-  def format_text(text, ragel: true, **options)
-    if ragel
-      raw DTextRagel.parse(text, **options)
-    else
-      DText.parse(text)
-    end
+  def format_text(text, **options)
+    raw DTextRagel.parse(text, **options)
+  rescue DTextRagel::Error => e
+    raw ""
   end
 
-  def strip_dtext(text, options = {})
-    if options[:ragel]
-      raw(DTextRagel.parse_strip(text))
-    else
-      DText.parse_strip(text)
-    end
+  def strip_dtext(text)
+    format_text(text, strip: true)
   end
 
   def error_messages_for(instance_name)
@@ -81,16 +75,56 @@ module ApplicationHelper
     content_tag(:time, content || datetime, :datetime => datetime, :title => time.to_formatted_s)
   end
 
-  def time_ago_in_words_tagged(time)
-    raw time_tag(time_ago_in_words(time) + " ago", time)
+  def humanized_duration(from, to)
+    duration = distance_of_time_in_words(from, to)
+    datetime = from.iso8601 + "/" + to.iso8601
+    title = "#{from.strftime("%Y-%m-%d %H:%M")} to #{to.strftime("%Y-%m-%d %H:%M")}"
+
+    raw content_tag(:time, duration, datetime: datetime, title: title)
+  end
+
+  def time_ago_in_words_tagged(time, compact: false)
+    if time.past?
+      text = time_ago_in_words(time) + " ago"
+      text = text.gsub(/almost|about|over/, "") if compact
+      raw time_tag(text, time)
+    else
+      raw time_tag("in " + distance_of_time_in_words(Time.now, time), time)
+    end
   end
 
   def compact_time(time)
     time_tag(time.strftime("%Y-%m-%d %H:%M"), time)
   end
 
+  def external_link_to(url, options = {})
+    if options[:truncate]
+      text = truncate(url, length: options[:truncate])
+    else
+      text = url
+    end
+
+    if url =~ %r!\Ahttps?://!i
+      link_to text, url, {rel: :nofollow}
+    else
+      url
+    end
+  end
+
   def link_to_ip(ip)
     link_to ip, moderator_ip_addrs_path(:search => {:ip_addr => ip})
+  end
+
+  def link_to_search(search)
+    link_to search, posts_path(tags: search)
+  end
+
+  def link_to_wiki(*wiki_titles, **options)
+    links = wiki_titles.map do |title|
+      link_to title.tr("_", " "), wiki_pages_path(title: title)
+    end
+
+    to_sentence(links, **options)
   end
 
   def link_to_user(user, options = {})
@@ -126,12 +160,13 @@ module ApplicationHelper
   end
 
   def dtext_field(object, name, options = {})
-    options[:name] ||= "Body"
+    options[:name] ||= name.capitalize
     options[:input_id] ||= "#{object}_#{name}"
     options[:input_name] ||= "#{object}[#{name}]"
     options[:value] ||= instance_variable_get("@#{object}").try(name)
     options[:preview_id] ||= "dtext-preview"
     options[:classes] ||= ""
+    options[:type] ||= "text"
 
     render "dtext/form", options
   end
@@ -142,20 +177,32 @@ module ApplicationHelper
     submit_tag("Preview", "data-input-id" => options[:input_id], "data-preview-id" => options[:preview_id])
   end
 
-  def search_field(method, options = {})
-    name = options[:label] || method.titleize
-    string = '<div class="input"><label for="search_' + method + '">' + name + '</label><input type="text" name="search[' + method + ']" id="search_'  + method + '">'
-    if options[:hint]
-      string += '<p class="hint">' + options[:hint] + '</p>'
+  def search_field(method, label: method.titleize, hint: nil, value: nil, **attributes)
+    content_tag(:div, class: "input") do
+      label_html = label_tag("search_#{method}", label)
+      input_html = text_field_tag(method, value, id: "search_#{method}", name: "search[#{method}]", **attributes)
+      hint_html = hint.present? ? content_tag(:p, hint, class: "hint") : ""
+
+      label_html + input_html + hint_html
     end
-    string += '</div>'
-    string.html_safe
+  end
+
+  def body_attributes(user = CurrentUser.user)
+    attributes = [:id, :name, :level, :level_string, :can_approve_posts?, :can_upload_free?]
+    attributes += User::Roles.map { |role| :"is_#{role}?" }
+
+    attributes.map do |attr|
+      name = attr.to_s.dasherize.delete("?")
+      value = user.send(attr)
+
+      %{data-user-#{name}="#{h(value)}"}
+    end.join(" ").html_safe
   end
   
 protected
   def nav_link_match(controller, url)
     url =~ case controller
-    when "sessions", "users", "maintenance/user/login_reminders", "maintenance/user/password_resets", "admin/users", "tag_subscriptions"
+    when "sessions", "users", "maintenance/user/login_reminders", "maintenance/user/password_resets", "admin/users"
       /^\/(session|users)/
 
     when "forum_posts"

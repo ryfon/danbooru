@@ -3,23 +3,21 @@ require 'test_helper'
 class TagAliasCorrectionTest < ActiveSupport::TestCase
   context "A tag alias correction" do
     setup do
-      @mod = FactoryGirl.create(:moderator_user)
+      @mod = FactoryBot.create(:moderator_user)
       CurrentUser.user = @mod
       CurrentUser.ip_addr = "127.0.0.1"
-      MEMCACHE.flush_all
-      @post = FactoryGirl.create(:post, :tag_string => "aaa")
-      @tag_alias = FactoryGirl.create(:tag_alias, :antecedent_name => "aaa", :consequent_name => "bbb")
+      @post = FactoryBot.create(:post, :tag_string => "aaa")
+      @tag_alias = FactoryBot.create(:tag_alias, :antecedent_name => "aaa", :consequent_name => "bbb")
     end
 
     teardown do
-      MEMCACHE.flush_all
       CurrentUser.user = nil
       CurrentUser.ip_addr = nil
     end
 
     context "with a bad cache and post counts" do
       setup do
-        Cache.put("ta:aaa", "zzz")
+        Cache.put("ta:#{Cache.hash('aaa')}", "zzz")
         Tag.where(:name => "aaa").update_all("post_count = -3")
         @correction = TagAliasCorrection.new(@tag_alias.id)
       end
@@ -48,7 +46,7 @@ class TagAliasCorrectionTest < ActiveSupport::TestCase
         end
 
         should "now have the correct cache" do
-          assert_equal("bbb", Cache.get("ta:aaa"))
+          assert_equal("bbb", Cache.get("ta:#{Cache.hash('aaa')}"))
         end
 
         should "now have the correct count" do

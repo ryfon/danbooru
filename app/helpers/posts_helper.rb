@@ -1,11 +1,29 @@
 module PostsHelper
+  def discover_mode?
+    params[:tags] =~ /order:rank/ || params[:action] =~ /searches|viewed/
+  end
+
+  def next_page_url
+    current_page = (params[:page] || 1).to_i
+    url_for(nav_params_for(current_page + 1)).html_safe
+  end
+
+  def prev_page_url
+    current_page = (params[:page] || 1).to_i
+    if current_page >= 2
+      url_for(nav_params_for(current_page - 1)).html_safe
+    else
+      nil
+    end
+  end
+
   def missed_post_search_count_js
     return nil unless Danbooru.config.enable_post_search_counts
     
     if params[:ms] == "1" && @post_set.post_count == 0 && @post_set.is_single_tag?
       session_id = session.id
-      digest = OpenSSL::Digest.new("sha256")
-      sig = OpenSSL::HMAC.hexdigest(digest, Danbooru.config.reportbooru_key, ",#{session_id}")
+      verifier = ActiveSupport::MessageVerifier.new(Danbooru.config.reportbooru_key, serializer: JSON, digest: "SHA256")
+      sig = verifier.generate(",#{session_id}")
       return render("posts/partials/index/missed_search_count", session_id: session_id, sig: sig)
     end
   end
@@ -19,13 +37,21 @@ module PostsHelper
       if tags.present?
         key = "ps-#{tags}"
         value = session.id
-        digest = OpenSSL::Digest.new("sha256")
-        sig = OpenSSL::HMAC.hexdigest(digest, Danbooru.config.reportbooru_key, "#{key},#{value}")
+        verifier = ActiveSupport::MessageVerifier.new(Danbooru.config.reportbooru_key, serializer: JSON, digest: "SHA256")
+        sig = verifier.generate("#{key},#{value}")
         return render("posts/partials/index/search_count", key: key, value: value, sig: sig)
       end
     end
 
     return nil
+  end
+
+  def post_view_count_js
+    return nil unless Danbooru.config.enable_post_search_counts
+
+    msg = "#{params[:id]},#{session.id}"
+    msg = ActiveSupport::MessageVerifier.new(Danbooru.config.reportbooru_key, serializer: JSON, digest: "SHA256").generate(msg)
+    return render("posts/partials/show/view_count", msg: msg)
   end
 
   def common_searches_html(user)
@@ -35,8 +61,8 @@ module PostsHelper
 
     key = "uid"
     value = user.id
-    digest = OpenSSL::Digest.new("sha256")
-    sig = OpenSSL::HMAC.hexdigest(digest, Danbooru.config.reportbooru_key, "#{key},#{value}")
+    verifier = ActiveSupport::MessageVerifier.new(Danbooru.config.reportbooru_key, serializer: JSON, digest: "SHA256")
+    sig = verifier.generate("#{key},#{value}")
     render("users/common_searches", user: user, sig: sig)
   end
 
@@ -104,5 +130,12 @@ module PostsHelper
     html << link_to("&laquo; hide".html_safe, "#", :id => "has-children-relationship-preview-link")
 
     html.html_safe
+  end
+
+  private
+
+  def nav_params_for(page)
+    query_params = params.except(:controller, :action, :id).merge(page: page).permit!
+    { params: query_params }
   end
 end

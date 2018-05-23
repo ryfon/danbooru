@@ -1,31 +1,26 @@
-class Comment < ActiveRecord::Base
+class Comment < ApplicationRecord
   include Mentionable
 
   validate :validate_post_exists, :on => :create
   validate :validate_creator_is_not_limited, :on => :create
   validates_format_of :body, :with => /\S/, :message => 'has no content'
   belongs_to :post
-  belongs_to :creator, :class_name => "User"
-  belongs_to :updater, :class_name => "User"
+  belongs_to_creator
+  belongs_to_updater
   has_many :votes, :class_name => "CommentVote", :dependent => :destroy
-  before_validation :initialize_creator, :on => :create
-  before_validation :initialize_updater
   after_create :update_last_commented_at_on_create
-  after_update(:if => lambda {|rec| CurrentUser.id != rec.creator_id}) do |rec|
-    ModAction.log("comment ##{rec.id} updated by #{CurrentUser.name}")
+  after_update(:if => ->(rec) {(!rec.is_deleted? || !rec.saved_change_to_is_deleted?) && CurrentUser.id != rec.creator_id}) do |rec|
+    ModAction.log("comment ##{rec.id} updated by #{CurrentUser.name}",:comment_update)
   end
-  after_destroy :update_last_commented_at_on_destroy
-  after_destroy(:if => lambda {|rec| CurrentUser.id != rec.creator_id}) do |rec|
-    ModAction.log("comment ##{rec.id} deleted by #{CurrentUser.name}")
+  after_save :update_last_commented_at_on_destroy, :if => ->(rec) {rec.is_deleted? && rec.saved_change_to_is_deleted?}
+  after_save(:if => ->(rec) {rec.is_deleted? && rec.saved_change_to_is_deleted? && CurrentUser.id != rec.creator_id}) do |rec|
+    ModAction.log("comment ##{rec.id} deleted by #{CurrentUser.name}",:comment_delete)
   end
-  attr_accessible :body, :post_id, :do_not_bump_post, :is_deleted, :as => [:member, :gold, :platinum, :builder, :janitor, :moderator, :admin]
-  attr_accessible :is_sticky, :as => [:moderator, :admin]
   mentionable(
     :message_field => :body, 
-    :user_field => :creator_id, 
-    :title => "You were mentioned in a comment",
-    :body => lambda {|rec, user_name| "You were mentioned in a \"comment\":/posts/#{rec.post_id}#comment-#{rec.id}\n\n---\n\n[i]#{rec.creator.name} said:[/i]\n\n#{ActionController::Base.helpers.excerpt(rec.body, user_name)}"}
-    )
+    :title => ->(user_name) {"#{creator_name} mentioned you in a comment on post ##{post_id}"},
+    :body => ->(user_name) {"@#{creator_name} mentioned you in a \"comment\":/posts/#{post_id}#comment-#{id} on post ##{post_id}:\n\n[quote]\n#{DText.excerpt(body, "@"+user_name)}\n[/quote]\n"},
+  )
 
   module SearchMethods
     def recent
@@ -41,11 +36,19 @@ class Comment < ActiveRecord::Base
     end
 
     def hidden(user)
-      where("score < ? and is_sticky = false", user.comment_threshold)
+      if user.is_moderator?
+        where("(score < ? and is_sticky = false) or is_deleted = true", user.comment_threshold)
+      else
+        where("score < ? and is_sticky = false", user.comment_threshold)
+      end
     end
 
     def visible(user)
-      where("score >= ? or is_sticky = true", user.comment_threshold)
+      if user.is_moderator?
+        where("(score >= ? or is_sticky = true) and is_deleted = false", user.comment_threshold)
+      else
+        where("score >= ? or is_sticky = true", user.comment_threshold)
+      end
     end
 
     def deleted
@@ -54,22 +57,6 @@ class Comment < ActiveRecord::Base
 
     def undeleted
       where("comments.is_deleted = false")
-    end
-
-    def sticky
-      where("comments.is_sticky = true")
-    end
-
-    def unsticky
-      where("comments.is_sticky = false")
-    end
-
-    def bumping
-      where("comments.do_not_bump_post = false")
-    end
-
-    def nonbumping
-      where("comments.do_not_bump_post = true")
     end
 
     def post_tags_match(query)
@@ -85,15 +72,10 @@ class Comment < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:body_matches].present?
         q = q.body_matches(params[:body_matches])
-      end
-
-      if params[:id].present?
-        q = q.where("id in (?)", params[:id].split(",").map(&:to_i))
       end
 
       if params[:post_id].present?
@@ -112,14 +94,9 @@ class Comment < ActiveRecord::Base
         q = q.for_creator(params[:creator_id].to_i)
       end
 
-      q = q.deleted if params[:is_deleted] == "true"
-      q = q.undeleted if params[:is_deleted] == "false"
-
-      q = q.sticky if params[:is_sticky] == "true"
-      q = q.unsticky if params[:is_sticky] == "false"
-
-      q = q.nonbumping if params[:do_not_bump_post] == "true"
-      q = q.bumping if params[:do_not_bump_post] == "false"
+      q = q.attribute_matches(:is_deleted, params[:is_deleted])
+      q = q.attribute_matches(:is_sticky, params[:is_sticky])
+      q = q.attribute_matches(:do_not_bump_post, params[:do_not_bump_post])
 
       case params[:order]
       when "post_id", "post_id_desc"
@@ -129,7 +106,7 @@ class Comment < ActiveRecord::Base
       when "updated_at", "updated_at_desc"
         q = q.order("comments.updated_at DESC")
       else
-        q = q.order("comments.id DESC")
+        q = q.apply_default_order(params)
       end
 
       q
@@ -169,24 +146,6 @@ class Comment < ActiveRecord::Base
 
   extend SearchMethods
   include VoteMethods
-
-  def initialize_creator
-    self.creator_id = CurrentUser.user.id
-    self.ip_addr = CurrentUser.ip_addr
-  end
-
-  def initialize_updater
-    self.updater_id = CurrentUser.user.id
-    self.updater_ip_addr = CurrentUser.ip_addr
-  end
-
-  def creator_name
-    User.id_to_name(creator_id)
-  end
-
-  def updater_name
-    User.id_to_name(updater_id)
-  end
 
   def validate_post_exists
     errors.add(:post, "must exist") unless Post.exists?(post_id)
@@ -243,12 +202,14 @@ class Comment < ActiveRecord::Base
   end
 
   def delete!
-    update({ :is_deleted => true }, :as => CurrentUser.role)
+    update(is_deleted: true)
   end
 
   def undelete!
-    update({ :is_deleted => false }, :as => CurrentUser.role)
+    update(is_deleted: false)
+  end
+
+  def quoted_response
+    DText.quote(body, creator_name)
   end
 end
-
-Comment.connection.extend(PostgresExtensions)

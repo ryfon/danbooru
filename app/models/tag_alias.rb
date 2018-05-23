@@ -1,68 +1,20 @@
-class TagAlias < ActiveRecord::Base
-  attr_accessor :skip_secondary_validations
-
+class TagAlias < TagRelationship
   before_save :ensure_tags_exist
   after_save :clear_all_cache
   after_destroy :clear_all_cache
   after_save :create_mod_action
-  before_validation :initialize_creator, :on => :create
-  before_validation :normalize_names
-  validates_format_of :status, :with => /\A(active|deleted|pending|processing|queued|error: .*)\Z/
-  validates_presence_of :creator_id, :antecedent_name, :consequent_name
-  validates :creator, presence: { message: "must exist" }, if: lambda { creator_id.present? }
-  validates :approver, presence: { message: "must exist" }, if: lambda { approver_id.present? }
-  validates :forum_topic, presence: { message: "must exist" }, if: lambda { forum_topic_id.present? }
   validates_uniqueness_of :antecedent_name
   validate :absence_of_transitive_relation
   validate :antecedent_and_consequent_are_different
   validate :consequent_has_wiki_page, :on => :create
   validate :mininum_antecedent_count, :on => :create
-  belongs_to :creator, :class_name => "User"
-  belongs_to :approver, :class_name => "User"
-  belongs_to :forum_topic
-  attr_accessible :antecedent_name, :consequent_name, :forum_topic_id, :skip_secondary_validations
-  attr_accessible :status, :approver_id, :as => [:admin]
-
-  module SearchMethods
-    def name_matches(name)
-      where("(antecedent_name like ? escape E'\\\\' or consequent_name like ? escape E'\\\\')", name.mb_chars.downcase.to_escaped_for_sql_like, name.downcase.to_escaped_for_sql_like)
-    end
-    
-    def active
-      where("status IN (?)", ["active", "processing"])
-    end
-
-    def search(params)
-      q = where("true")
-      return q if params.blank?
-
-      if params[:name_matches].present?
-        q = q.name_matches(params[:name_matches])
-      end
-
-      if params[:antecedent_name].present?
-        q = q.where("antecedent_name = ?", params[:antecedent_name])
-      end
-
-      if params[:id].present?
-        q = q.where("id in (?)", params[:id].split(",").map(&:to_i))
-      end
-
-      case params[:order]
-      when "created_at"
-        q = q.order("created_at desc")
-      end
-
-      q
-    end
-  end
 
   module CacheMethods
     extend ActiveSupport::Concern
 
     module ClassMethods
       def clear_cache_for(name)
-        Cache.delete("ta:#{Cache.sanitize(name)}")
+        Cache.delete("ta:#{Cache.hash(name)}")
       end
     end
 
@@ -77,41 +29,60 @@ class TagAlias < ActiveRecord::Base
     end
   end
 
-  extend SearchMethods
+  module ApprovalMethods
+    def approve!(update_topic: true, approver: CurrentUser.user)
+      CurrentUser.scoped(approver) do
+        update(status: "queued", approver_id: approver.id)
+        delay(:queue => "default").process!(update_topic: update_topic)
+      end
+    end
+  end
+
+  module ForumMethods
+    def forum_updater
+      @forum_updater ||= begin
+        post = if forum_topic
+          forum_post || forum_topic.posts.where("body like ?", TagAliasRequest.command_string(antecedent_name, consequent_name) + "%").last
+        else
+          nil
+        end
+        ForumUpdater.new(
+          forum_topic, 
+          forum_post: post,
+          expected_title: TagAliasRequest.topic_title(antecedent_name, consequent_name)
+        )
+      end
+    end
+  end
+
   include CacheMethods
+  include ApprovalMethods
+  include ForumMethods
 
   def self.to_aliased(names)
-    Array(names).flatten.map do |name|
-      Cache.get("ta:#{Cache.sanitize(name)}") do
-        ActiveRecord::Base.select_value_sql("select consequent_name from tag_aliases where status in ('active', 'processing') and antecedent_name = ?", name) || name.to_s
-      end
-    end.uniq
+    Cache.get_multi(Array(names), "ta") do |tag|
+      ActiveRecord::Base.select_value_sql("select consequent_name from tag_aliases where status in ('active', 'processing') and antecedent_name = ?", tag) || tag.to_s
+    end.values
   end
 
-  def approve!(approver = CurrentUser.user, update_topic: true)
-    update({ :status => "queued", :approver_id => approver.id }, :as => approver.role)
-    delay(:queue => "default").process!(update_topic)
-  end
-
-  def process!(update_topic=true)
+  def process!(update_topic: true)
     unless valid?
       raise errors.full_messages.join("; ")
     end
 
     tries = 0
-    forum_message = []
 
     begin
-      CurrentUser.scoped(approver, CurrentUser.ip_addr) do
-        update({ :status => "processing" }, :as => approver.role)
+      CurrentUser.scoped(approver) do
+        update(status: "processing")
         move_aliases_and_implications
         move_saved_searches
         clear_all_cache
         ensure_category_consistency
         update_posts
-        forum_message << "The tag alias [[#{antecedent_name}]] -> [[#{consequent_name}]] (alias ##{id}) has been approved."
-        forum_message << rename_wiki_and_artist
-        update({ :status => "active", :post_count => consequent_tag.post_count }, :as => approver.role)
+        forum_updater.update(approval_message(approver), "APPROVED") if update_topic
+        rename_wiki_and_artist
+        update(status: "active", post_count: consequent_tag.post_count)
       end
     rescue Exception => e
       if tries < 5
@@ -120,45 +91,15 @@ class TagAlias < ActiveRecord::Base
         retry
       end
 
-      forum_message << "The tag alias [[#{antecedent_name}]] -> [[#{consequent_name}]] (alias ##{id}) failed during processing. Reason: #{e}"
-      update({ :status => "error: #{e}" }, :as => approver.role)
+      CurrentUser.scoped(approver) do
+        forum_updater.update(failure_message(e), "FAILED") if update_topic
+        update(status: "error: #{e}")
+      end
 
       if Rails.env.production?
         NewRelic::Agent.notice_error(e, :custom_params => {:tag_alias_id => id, :antecedent_name => antecedent_name, :consequent_name => consequent_name})
       end
-    ensure
-      if update_topic && forum_topic.present?
-        CurrentUser.scoped(approver, CurrentUser.ip_addr) do
-          forum_topic.posts.create(:body => forum_message.join("\n\n"))
-        end
-      end
     end
-  end
-
-  def is_pending?
-    status == "pending"
-  end
-
-  def is_active?
-    status == "active"
-  end
-  
-  def normalize_names
-    self.antecedent_name = antecedent_name.mb_chars.downcase.tr(" ", "_")
-    self.consequent_name = consequent_name.downcase.tr(" ", "_")
-  end
-
-  def initialize_creator
-    self.creator_id = CurrentUser.user.id
-    self.creator_ip_addr = CurrentUser.ip_addr
-  end
-
-  def antecedent_tag
-    Tag.find_or_create_by_name(antecedent_name)
-  end
-
-  def consequent_tag
-    Tag.find_or_create_by_name(consequent_name)
   end
 
   def absence_of_transitive_relation
@@ -182,8 +123,8 @@ class TagAlias < ActiveRecord::Base
     escaped = Regexp.escape(antecedent_name)
 
     if SavedSearch.enabled?
-      SavedSearch.where("tag_query like ?", "%#{antecedent_name}%").find_each do |ss|
-        ss.tag_query = ss.tag_query.sub(/(?:^| )#{escaped}(?:$| )/, " #{consequent_name} ").strip.gsub(/  /, " ")
+      SavedSearch.where("query like ?", "%#{antecedent_name}%").find_each do |ss|
+        ss.query = ss.query.sub(/(?:^| )#{escaped}(?:$| )/, " #{consequent_name} ").strip.gsub(/  /, " ")
         ss.save
       end
     end
@@ -226,7 +167,6 @@ class TagAlias < ActiveRecord::Base
   def ensure_category_consistency
     if antecedent_tag.category != consequent_tag.category && antecedent_tag.category != Tag.categories.general
       consequent_tag.update_attribute(:category, antecedent_tag.category)
-      consequent_tag.update_category_cache_for_all
     end
 
     true
@@ -250,18 +190,14 @@ class TagAlias < ActiveRecord::Base
   end
 
   def rename_wiki_and_artist
-    message = ""
-
     antecedent_wiki = WikiPage.titled(antecedent_name).first
     if antecedent_wiki.present? 
       if WikiPage.titled(consequent_name).blank?
         CurrentUser.scoped(creator, creator_ip_addr) do
-          antecedent_wiki.update_attributes(
-            :title => consequent_name
-          )
+          antecedent_wiki.update(title: consequent_name, skip_secondary_validations: true)
         end
       else
-        message = "The tag alias [[#{antecedent_name}]] -> [[#{consequent_name}]] (alias ##{id}) has conflicting wiki pages. [[#{consequent_name}]] should be updated to include information from [[#{antecedent_name}]] if necessary."
+        forum_updater.update(conflict_message)
       end
     end
 
@@ -275,33 +211,12 @@ class TagAlias < ActiveRecord::Base
         end
       end
     end
-
-    message
-  end
-
-  def deletable_by?(user)
-    return true if user.is_admin?
-    return true if is_pending? && user.is_builder?
-    return true if is_pending? && user.id == creator_id
-    return false
-  end
-
-  def editable_by?(user)
-    deletable_by?(user)
-  end
-
-  def update_forum_topic_for_reject
-    if forum_topic
-      forum_topic.posts.create(
-        :body => "The tag alias [[#{antecedent_name}]] -> [[#{consequent_name}]] (alias ##{id}) has been rejected."
-      )
-    end
   end
 
   def reject!
-    update({ :status => "deleted", }, :as => CurrentUser.role)
+    update(status: "deleted")
     clear_all_cache
-    update_forum_topic_for_reject
+    forum_updater.update(reject_message(CurrentUser.user), "REJECTED")
     destroy
   end
 
@@ -309,7 +224,7 @@ class TagAlias < ActiveRecord::Base
     return if skip_secondary_validations
 
     unless WikiPage.titled(consequent_name).exists?
-      self.errors[:base] = "The #{consequent_name} tag needs a corresponding wiki page"
+      self.errors[:base] << "The #{consequent_name} tag needs a corresponding wiki page"
       return false
     end
   end
@@ -318,7 +233,7 @@ class TagAlias < ActiveRecord::Base
     return if skip_secondary_validations
 
     unless Post.fast_count(antecedent_name) >= 50
-      self.errors[:base] = "The #{antecedent_name} tag must have at least 50 posts for an alias to be created"
+      self.errors[:base] << "The #{antecedent_name} tag must have at least 50 posts for an alias to be created"
     end
   end
 
@@ -331,11 +246,11 @@ class TagAlias < ActiveRecord::Base
   def create_mod_action
     alias_desc = %Q("tag alias ##{id}":[#{Rails.application.routes.url_helpers.tag_alias_path(self)}]: [[#{antecedent_name}]] -> [[#{consequent_name}]])
 
-    if id_changed?
-      ModAction.log("created #{status} #{alias_desc}")
+    if saved_change_to_id?
+      ModAction.log("created #{status} #{alias_desc}",:tag_alias_create)
     else
       # format the changes hash more nicely.
-      change_desc = changes.except(:updated_at).map do |attribute, values|
+      change_desc = saved_changes.except(:updated_at).map do |attribute, values|
         old, new = values[0], values[1]
         if old.nil?
           %Q(set #{attribute} to "#{new}")
@@ -344,7 +259,7 @@ class TagAlias < ActiveRecord::Base
         end
       end.join(", ")
 
-      ModAction.log("updated #{alias_desc}\n#{change_desc}")
+      ModAction.log("updated #{alias_desc}\n#{change_desc}",:tag_alias_update)
     end
   end
 end

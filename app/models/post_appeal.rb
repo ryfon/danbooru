@@ -1,4 +1,4 @@
-class PostAppeal < ActiveRecord::Base
+class PostAppeal < ApplicationRecord
   class Error < Exception ; end
 
   belongs_to :creator, :class_name => "User"
@@ -8,12 +8,18 @@ class PostAppeal < ActiveRecord::Base
   validate :validate_creator_is_not_limited
   before_validation :initialize_creator, :on => :create
   validates_uniqueness_of :creator_id, :scope => :post_id, :message => "have already appealed this post"
-  attr_accessible :post_id, :post, :reason
 
   module SearchMethods
     def reason_matches(query)
-      query = "*#{query}*" unless query =~ /\*/
-      where("reason ILIKE ? ESCAPE E'\\\\'", query.to_escaped_for_sql_like)
+      if query =~ /\*/
+        where("post_appeals.reason ILIKE ? ESCAPE E'\\\\'", query.to_escaped_for_sql_like)
+      else
+        where("to_tsvector('english', post_appeals.reason) @@ plainto_tsquery(?)", query.to_escaped_for_tsquery)
+      end
+    end
+
+    def post_tags_match(query)
+      PostQueryBuilder.new(query).build(self.joins(:post))
     end
 
     def resolved
@@ -37,15 +43,14 @@ class PostAppeal < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:reason_matches].present?
         q = q.reason_matches(params[:reason_matches])
       end
 
       if params[:creator_id].present?
-        q = q.for_user(params[:creator_id].to_i)
+        q = q.where(creator_id: params[:creator_id].split(",").map(&:to_i))
       end
 
       if params[:creator_name].present?
@@ -53,16 +58,17 @@ class PostAppeal < ActiveRecord::Base
       end
 
       if params[:post_id].present?
-        q = q.where("post_id = ?", params[:post_id].to_i)
+        q = q.where(post_id: params[:post_id].split(",").map(&:to_i))
       end
 
-      if params[:is_resolved] == "true"
-        q = q.resolved
-      elsif params[:is_resolved] == "false"
-        q = q.unresolved
+      if params[:post_tags_match].present?
+        q = q.post_tags_match(params[:post_tags_match])
       end
 
-      q
+      q = q.resolved if params[:is_resolved].to_s.truthy?
+      q = q.unresolved if params[:is_resolved].to_s.falsy?
+
+      q.apply_default_order(params)
     end
   end
 

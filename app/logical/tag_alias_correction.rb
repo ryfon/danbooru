@@ -14,22 +14,19 @@ class TagAliasCorrection
 
   def statistics_hash
     @statistics_hash ||= {
-      "antecedent_cache" => Cache.get("ta:" + Cache.sanitize(tag_alias.antecedent_name)),
-      "consequent_cache" => Cache.get("ta:" + Cache.sanitize(tag_alias.consequent_name)),
+      "antecedent_cache" => Cache.get("ta:" + Cache.hash(tag_alias.antecedent_name)),
+      "consequent_cache" => Cache.get("ta:" + Cache.hash(tag_alias.consequent_name)),
       "antecedent_count" => Tag.find_by_name(tag_alias.antecedent_name).try(:post_count),
       "consequent_count" => Tag.find_by_name(tag_alias.consequent_name).try(:post_count)
     }
   end
 
   def fill_hash!
-    Net::HTTP.start(hostname, 80) do |http|
-      http.request_get("/tag_aliases/#{tag_alias_id}/correction.json") do |res|
-        if res === Net::HTTPSuccess
-          json = JSON.parse(res.body)
-          statistics_hash["antecedent_cache"] = json["antecedent_cache"]
-          statistics_hash["consequent_cache"] = json["consequent_cache"]
-        end
-      end
+    res = HTTParty.get("https://#{hostname}.#{Danbooru.config.domain}/tag_aliases/#{tag_alias_id}/correction.json", Danbooru.config.httparty_options)
+    if res.success?
+      json = JSON.parse(res.body)
+      statistics_hash["antecedent_cache"] = json["antecedent_cache"]
+      statistics_hash["consequent_cache"] = json["consequent_cache"]
     end
   end
 

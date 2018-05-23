@@ -4,8 +4,8 @@ class UserPasswordResetNonceTest < ActiveSupport::TestCase
   context "Creating a new nonce" do
     context "with a valid email" do
       setup do
-        @user = FactoryGirl.create(:user, :email => "aaa@b.net")
-        @nonce = FactoryGirl.create(:user_password_reset_nonce, :email => @user.email)
+        @user = FactoryBot.create(:user, :email => "aaa@b.net")
+        @nonce = FactoryBot.create(:user_password_reset_nonce, :email => @user.email)
       end
 
       should "validate" do
@@ -13,7 +13,7 @@ class UserPasswordResetNonceTest < ActiveSupport::TestCase
       end
 
       should "populate the key with a random string" do
-        assert_equal(32, @nonce.key.size)
+        assert_equal(24, @nonce.key.size)
       end
 
       should "reset the password when reset" do
@@ -24,7 +24,7 @@ class UserPasswordResetNonceTest < ActiveSupport::TestCase
 
     context "with a blank email" do
       setup do
-        @user = FactoryGirl.create(:user, :email => "")
+        @user = FactoryBot.create(:user, :email => "")
         @nonce = UserPasswordResetNonce.new(:email => "")
       end
 

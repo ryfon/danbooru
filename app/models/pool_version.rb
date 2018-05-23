@@ -1,11 +1,8 @@
-class PoolVersion < ActiveRecord::Base
+class PoolVersion < ApplicationRecord
   class Error < Exception ; end
 
-  validates_presence_of :updater_id, :updater_ip_addr
   belongs_to :pool
-  belongs_to :updater, :class_name => "User"
-  before_validation :initialize_updater
-  attr_accessible :pool_id, :is_deleted, :name, :description, :post_ids, :post_id_array, :post_count, :is_active, :category, :updater_id, :updater_ip_addr
+  belongs_to_updater
 
   module SearchMethods
     def for_user(user_id)
@@ -13,8 +10,7 @@ class PoolVersion < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:updater_id].present?
         q = q.for_user(params[:updater_id].to_i)
@@ -28,14 +24,14 @@ class PoolVersion < ActiveRecord::Base
         q = q.where("pool_id = ?", params[:pool_id].to_i)
       end
 
-      q
+      q.apply_default_order(params)
     end
   end
 
   extend SearchMethods
 
   def self.export_to_archives(starting_version_id = 0)
-    raise "SQS URL not setup" if Danbooru.config.aws_sqs_archives_url.nil?
+    raise NotImplementedError.new("SQS URL not setup") if Danbooru.config.aws_sqs_archives_url.nil?
 
     credentials = Aws::Credentials.new(
       Danbooru.config.aws_access_key_id,
@@ -74,17 +70,8 @@ class PoolVersion < ActiveRecord::Base
     puts "last version id: #{last_version_id}"
   end
 
-  def updater_name
-    User.id_to_name(updater_id)
-  end
-
   def pretty_name
     name.tr("_", " ")
-  end
-
-  def initialize_updater
-    self.updater_id = CurrentUser.id
-    self.updater_ip_addr = CurrentUser.ip_addr
   end
 
   def post_id_array

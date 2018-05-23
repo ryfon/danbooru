@@ -1,14 +1,14 @@
-class ForumPost < ActiveRecord::Base
+class ForumPost < ApplicationRecord
   include Mentionable
 
-  attr_accessible :body, :topic_id, :as => [:member, :builder, :janitor, :gold, :platinum, :admin, :moderator, :default]
-  attr_accessible :is_locked, :is_sticky, :is_deleted, :as => [:admin, :moderator]
   attr_readonly :topic_id
-  belongs_to :creator, :class_name => "User"
-  belongs_to :updater, :class_name => "User"
+  belongs_to_creator
+  belongs_to_updater
   belongs_to :topic, :class_name => "ForumTopic"
-  before_validation :initialize_creator, :on => :create
-  before_validation :initialize_updater
+  has_many :votes, class_name: "ForumPostVote"
+  has_one :tag_alias
+  has_one :tag_implication
+  has_one :bulk_update_request
   before_validation :initialize_is_deleted, :on => :create
   after_create :update_topic_updated_at_on_create
   after_update :update_topic_updated_at_on_update_for_original_posts
@@ -19,17 +19,16 @@ class ForumPost < ActiveRecord::Base
   validate :topic_is_not_restricted, :on => :create
   before_destroy :validate_topic_is_unlocked
   after_save :delete_topic_if_original_post
-  after_update(:if => lambda {|rec| rec.updater_id != rec.creator_id}) do |rec|
-    ModAction.log("#{CurrentUser.name} updated forum ##{rec.id}")
+  after_update(:if => ->(rec) {rec.updater_id != rec.creator_id}) do |rec|
+    ModAction.log("#{CurrentUser.name} updated forum ##{rec.id}",:forum_post_update)
   end
-  after_destroy(:if => lambda {|rec| rec.updater_id != rec.creator_id}) do |rec|
-    ModAction.log("#{CurrentUser.name} deleted forum ##{rec.id}")
+  after_destroy(:if => ->(rec) {rec.updater_id != rec.creator_id}) do |rec|
+    ModAction.log("#{CurrentUser.name} deleted forum ##{rec.id}",:forum_post_delete)
   end
   mentionable(
     :message_field => :body, 
-    :user_field => :creator_id, 
-    :title => "You were mentioned in a forum topic",
-    :body => lambda {|rec, user_name| "You were mentioned in the forum topic \"#{rec.topic.title}\":/forum_topics/#{rec.topic_id}?page=#{rec.forum_topic_page}\n\n---\n\n[i]#{rec.creator.name} said:[/i]\n\n#{ActionController::Base.helpers.excerpt(rec.body, user_name)}"}
+    :title => ->(user_name) {%{#{creator_name} mentioned you in topic ##{topic_id} (#{topic.title})}},
+    :body => ->(user_name) {%{@#{creator_name} mentioned you in topic ##{topic_id} ("#{topic.title}":[/forum_topics/#{topic_id}?page=#{forum_topic_page}]):\n\n[quote]\n#{DText.excerpt(body, "@"+user_name)}\n[/quote]\n}},
   )
 
   module SearchMethods
@@ -66,8 +65,8 @@ class ForumPost < ActiveRecord::Base
     end
 
     def search(params)
-      q = permitted
-      return q if params.blank?
+      q = super
+      q = q.permitted
 
       if params[:creator_id].present?
         q = q.where("forum_posts.creator_id = ?", params[:creator_id].to_i)
@@ -93,7 +92,9 @@ class ForumPost < ActiveRecord::Base
         q = q.joins(:topic).where("forum_topics.category_id = ?", params[:topic_category_id].to_i)
       end
 
-      q
+      q = q.attribute_matches(:is_deleted, params[:is_deleted])
+
+      q.apply_default_order(params)
     end
   end
 
@@ -133,27 +134,39 @@ class ForumPost < ActiveRecord::Base
     end
   end
 
+  def tag_change_request
+    bulk_update_request || tag_alias || tag_implication
+  end
+
+  def votable?
+    body.to_s.match?(/->/)
+  end
+
+  def voted?(user, score)
+    votes.where(creator_id: user.id, score: score).exists?
+  end
+
   def validate_topic_is_unlocked
     return if CurrentUser.is_moderator?
     return if topic.nil?
 
     if topic.is_locked?
-      errors.add(:topic, "is locked")
-      return false
-    else
-      return true
+      errors[:topic] << "is locked"
+      throw :abort
     end
   end
 
   def topic_id_not_invalid
     if topic_id && !topic
-      errors.add(:base, "Topic ID is invalid")
+      errors[:base] << "Topic ID is invalid"
+      return false
     end
   end
 
   def topic_is_not_restricted
     if topic && !topic.visible?(creator)
-      errors.add(:topic, "restricted")
+      errors[:topic] << "is restricted"
+      return false
     end
   end
 
@@ -180,12 +193,12 @@ class ForumPost < ActiveRecord::Base
   end
 
   def delete!
-    update_attributes({:is_deleted => true}, :as => CurrentUser.role)
+    update(is_deleted: true)
     update_topic_updated_at_on_delete
   end
 
   def undelete!
-    update_attributes({:is_deleted => false}, :as => CurrentUser.role)
+    update(is_deleted: false)
     update_topic_updated_at_on_undelete
   end
 
@@ -213,14 +226,6 @@ class ForumPost < ActiveRecord::Base
     end
   end
 
-  def initialize_creator
-    self.creator_id = CurrentUser.id
-  end
-
-  def initialize_updater
-    self.updater_id = CurrentUser.id
-  end
-
   def initialize_is_deleted
     self.is_deleted = false if is_deleted.nil?
   end
@@ -234,16 +239,19 @@ class ForumPost < ActiveRecord::Base
   end
 
   def quoted_response
-    stripped_body = DText.strip_blocks(body, "quote")
-    "[quote]\n#{creator_name} said:\n\n#{stripped_body}\n[/quote]\n\n"
+    DText.quote(body, creator_name)
   end
 
   def forum_topic_page
     ((ForumPost.where("topic_id = ? and created_at <= ?", topic_id, created_at).count) / Danbooru.config.posts_per_page.to_f).ceil
   end
 
-  def is_original_post?
-    ForumPost.exists?(["id = ? and id = (select _.id from forum_posts _ where _.topic_id = ? order by _.id asc limit 1)", id, topic_id])
+  def is_original_post?(original_post_id = nil)
+    if original_post_id
+      return id == original_post_id
+    else
+      ForumPost.exists?(["id = ? and id = (select _.id from forum_posts _ where _.topic_id = ? order by _.id asc limit 1)", id, topic_id])
+    end
   end
 
   def delete_topic_if_original_post

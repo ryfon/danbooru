@@ -3,6 +3,14 @@
     return $("meta[name=" + key + "]").attr("content");
   }
 
+  Danbooru.test_max_width = function(width) {
+    if (!window.matchMedia) {
+      return false;
+    }
+    var mq = window.matchMedia('(max-width: ' + width + 'px)');
+    return mq.matches;
+  }
+
   Danbooru.scrolling = false;
 
   Danbooru.scroll_to = function(element) {
@@ -118,6 +126,15 @@
         return sParameterName[1] === undefined ? true : sParameterName[1];
       }
     }
+  };
+
+  Danbooru.sorttable = function(table) {
+    table.stupidtable();
+    table.bind("aftertablesort", function(event, data) {
+      $("#c-saved-searches table tbody tr").removeClass("even odd");
+      $("#c-saved-searches table tbody tr:even").addClass("even");
+      $("#c-saved-searches table tbody tr:odd").addClass("odd");
+    });
   };
 
   String.prototype.hash = function() {

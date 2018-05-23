@@ -1,24 +1,20 @@
 require 'test_helper'
-require 'helpers/pool_archive_test_helper'
 
 module PostSets
   class PoolTest < ActiveSupport::TestCase
-    include PoolArchiveTestHelper
-
     context "In all cases" do
       setup do
-        @user = FactoryGirl.create(:user)
+        @user = FactoryBot.create(:user)
         CurrentUser.user = @user
         CurrentUser.ip_addr = "127.0.0.1"
-        MEMCACHE.flush_all
 
         mock_pool_archive_service!
         start_pool_archive_transaction
 
-        @post_1 = FactoryGirl.create(:post)
-        @post_2 = FactoryGirl.create(:post)
-        @post_3 = FactoryGirl.create(:post)
-        @pool = FactoryGirl.create(:pool)
+        @post_1 = FactoryBot.create(:post)
+        @post_2 = FactoryBot.create(:post)
+        @post_3 = FactoryBot.create(:post)
+        @pool = FactoryBot.create(:pool)
         @pool.add!(@post_2)
         @pool.add!(@post_1)
         @pool.add!(@post_3)

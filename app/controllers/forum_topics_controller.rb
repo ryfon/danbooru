@@ -1,11 +1,11 @@
 class ForumTopicsController < ApplicationController
   respond_to :html, :xml, :json
-  before_filter :member_only, :except => [:index, :show]
-  before_filter :moderator_only, :only => [:new_merge, :create_merge]
-  before_filter :normalize_search, :only => :index
-  before_filter :load_topic, :only => [:edit, :show, :update, :destroy, :undelete, :new_merge, :create_merge, :subscribe, :unsubscribe]
-  before_filter :check_min_level, :only => [:show, :edit, :update, :new_merge, :create_merge, :destroy, :undelete, :subscribe, :unsubscribe]
-  skip_before_filter :api_check
+  before_action :member_only, :except => [:index, :show]
+  before_action :moderator_only, :only => [:new_merge, :create_merge]
+  before_action :normalize_search, :only => :index
+  before_action :load_topic, :only => [:edit, :show, :update, :destroy, :undelete, :new_merge, :create_merge, :subscribe, :unsubscribe]
+  before_action :check_min_level, :only => [:show, :edit, :update, :new_merge, :create_merge, :destroy, :undelete, :subscribe, :unsubscribe]
+  skip_before_action :api_check
 
   def new
     @forum_topic = ForumTopic.new
@@ -19,10 +19,19 @@ class ForumTopicsController < ApplicationController
   end
 
   def index
-    @query = ForumTopic.active.search(params[:search])
-    @forum_topics = @query.includes([:creator, :updater]).order("is_sticky DESC, updated_at DESC").paginate(params[:page], :limit => per_page, :search_count => params[:search])
+    params[:search] ||= {}
+    params[:search][:order] ||= "sticky" if request.format == Mime::Type.lookup("text/html")
+
+    @query = ForumTopic.active.search(search_params)
+    @forum_topics = @query.paginate(params[:page], :limit => per_page, :search_count => params[:search])
 
     respond_with(@forum_topics) do |format|
+      format.html do
+        @forum_topics = @forum_topics.includes(:creator, :updater).load
+      end
+      format.atom do
+        @forum_topics = @forum_topics.includes(:creator, :original_post).load
+      end
       format.json do
         render :json => @forum_topics.to_json
       end
@@ -33,28 +42,33 @@ class ForumTopicsController < ApplicationController
   end
 
   def show
-    unless CurrentUser.user.is_anonymous?
+    if request.format == Mime::Type.lookup("text/html")
       @forum_topic.mark_as_read!(CurrentUser.user)
     end
-    @forum_posts = ForumPost.search(:topic_id => @forum_topic.id).order("forum_posts.id").paginate(params[:page])
-    @forum_posts.each # hack to force rails to eager load
-    respond_with(@forum_topic)
+    @forum_posts = ForumPost.search(:topic_id => @forum_topic.id).reorder("forum_posts.id").paginate(params[:page])
+    @original_forum_post_id = @forum_topic.original_post.id
+    respond_with(@forum_topic) do |format|
+      format.atom do
+        @forum_posts = @forum_posts.reverse_order.includes(:creator).load
+      end
+    end
   end
 
   def create
-    @forum_topic = ForumTopic.create(params[:forum_topic], :as => CurrentUser.role)
+    @forum_topic = ForumTopic.create(forum_topic_params(:create))
     respond_with(@forum_topic)
   end
 
   def update
     check_privilege(@forum_topic)
-    @forum_topic.update_attributes(params[:forum_topic], :as => CurrentUser.role)
+    @forum_topic.update(forum_topic_params(:update))
     respond_with(@forum_topic)
   end
 
   def destroy
     check_privilege(@forum_topic)
     @forum_topic.delete!
+    @forum_topic.create_mod_action_for_delete
     flash[:notice] = "Topic deleted"
     respond_with(@forum_topic)
   end
@@ -62,6 +76,7 @@ class ForumTopicsController < ApplicationController
   def undelete
     check_privilege(@forum_topic)
     @forum_topic.undelete!
+    @forum_topic.create_mod_action_for_undelete
     flash[:notice] = "Topic undeleted"
     respond_with(@forum_topic)
   end
@@ -133,15 +148,22 @@ private
         end
 
         fmt.json do
-          render :nothing => true, :status => 403
+          render json: nil, :status => 403
         end
 
         fmt.xml do
-          render :nothing => true, :status => 403
+          render xml: nil, :status => 403
         end
       end
 
       return false
     end
+  end
+
+  def forum_topic_params(context)
+    permitted_params = [:title, :category_id, { original_post_attributes: %i[id body] }]
+    permitted_params += %i[is_sticky is_locked min_level] if CurrentUser.is_moderator?
+
+    params.require(:forum_topic).permit(permitted_params)
   end
 end

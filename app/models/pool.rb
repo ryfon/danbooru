@@ -1,95 +1,73 @@
 require 'ostruct'
 
-class Pool < ActiveRecord::Base
+class Pool < ApplicationRecord
   class RevertError < Exception ; end
 
-  validates_uniqueness_of :name, :case_sensitive => false
-  validates_format_of :name, :with => /\A[^,]+\Z/, :message => "cannot have commas"
+  attribute :updater_id, :integer
+  validates_uniqueness_of :name, :case_sensitive => false, :if => :saved_change_to_name?
+  validate :validate_name, :if => :saved_change_to_name?
   validates_inclusion_of :category, :in => %w(series collection)
   validate :updater_can_change_category
-  validate :name_does_not_conflict_with_metatags
   validate :updater_can_remove_posts
-  belongs_to :creator, :class_name => "User"
-  belongs_to :updater, :class_name => "User"
+  validate :updater_can_edit_deleted
+  belongs_to_creator
+  belongs_to_updater
   before_validation :normalize_post_ids
   before_validation :normalize_name
   before_validation :initialize_is_active, :on => :create
-  before_validation :initialize_creator, :on => :create
-  before_validation :strip_name
   after_save :update_category_pseudo_tags_for_posts_async
   after_save :create_version
   after_create :synchronize!
   before_destroy :create_mod_action_for_destroy
-  attr_accessible :name, :description, :post_ids, :post_id_array, :post_count, :is_active, :category, :as => [:member, :gold, :platinum, :janitor, :moderator, :admin, :default]
-  attr_accessible :is_deleted, :as => [:moderator, :admin]
 
   module SearchMethods
     def deleted
-      where("is_deleted = true")
+      where("pools.is_deleted = true")
     end
 
     def undeleted
-      where("is_deleted = false")
+      where("pools.is_deleted = false")
     end
 
     def series
-      where("category = ?", "series")
+      where("pools.category = ?", "series")
     end
 
     def collection
-      where("category = ?", "collection")
+      where("pools.category = ?", "collection")
     end
 
     def series_first
-      order("(case category when 'series' then 0 else 1 end), name")
+      order(Arel.sql("(case pools.category when 'series' then 0 else 1 end), pools.name"))
     end
 
     def name_matches(name)
-      name = name.tr(" ", "_")
+      name = normalize_name_for_search(name)
       name = "*#{name}*" unless name =~ /\*/
-      where("name ilike ? escape E'\\\\'", name.to_escaped_for_sql_like)
+      where("lower(pools.name) like ? escape E'\\\\'", name.to_escaped_for_sql_like)
+    end
+
+    def default_order
+      order(updated_at: :desc)
     end
 
     def search(params)
-      q = where("true")
-      params = {} if params.blank?
+      q = super
 
       if params[:name_matches].present?
         q = q.name_matches(params[:name_matches])
       end
 
-      if params[:id].present?
-        q = q.where("id in (?)", params[:id].split(","))
-      end
-
       if params[:description_matches].present?
-        q = q.where("lower(description) like ? escape E'\\\\'", "%" + params[:description_matches].mb_chars.downcase.to_escaped_for_sql_like + "%")
+        q = q.where("lower(pools.description) like ? escape E'\\\\'", "%" + params[:description_matches].mb_chars.downcase.to_escaped_for_sql_like + "%")
       end
 
       if params[:creator_name].present?
-        q = q.where("creator_id = (select _.id from users _ where lower(_.name) = ?)", params[:creator_name].tr(" ", "_").mb_chars.downcase)
+        q = q.where("pools.creator_id = (select _.id from users _ where lower(_.name) = ?)", params[:creator_name].tr(" ", "_").mb_chars.downcase)
       end
 
       if params[:creator_id].present?
-        q = q.where("creator_id = ?", params[:creator_id].to_i)
-      end
-
-      if params[:is_active] == "true"
-        q = q.where("is_active = true")
-      elsif params[:is_active] == "false"
-        q = q.where("is_active = false")
-      end
-
-      params[:order] ||= params.delete(:sort)
-      case params[:order]
-      when "name"
-        q = q.order("name")
-      when "created_at"
-        q = q.order("created_at desc")
-      when "post_count"
-        q = q.order("post_count desc")
-      else
-        q = q.order("updated_at desc")
+        q = q.where(creator_id: params[:creator_id].split(",").map(&:to_i))
       end
 
       if params[:category] == "series"
@@ -98,10 +76,19 @@ class Pool < ActiveRecord::Base
         q = q.collection
       end
 
-      if params[:is_deleted] == "true"
-        q = q.deleted
+      q = q.attribute_matches(:is_active, params[:is_active])
+      q = q.attribute_matches(:is_deleted, params[:is_deleted])
+
+      params[:order] ||= params.delete(:sort)
+      case params[:order]
+      when "name"
+        q = q.order("pools.name")
+      when "created_at"
+        q = q.order("pools.created_at desc")
+      when "post_count"
+        q = q.order("pools.post_count desc").default_order
       else
-        q = q.undeleted
+        q = q.apply_default_order(params)
       end
 
       q
@@ -118,25 +105,12 @@ class Pool < ActiveRecord::Base
     end
   end
 
-  def self.id_to_name(id)
-    select_value_sql("SELECT name FROM pools WHERE id = ?", id)
-  end
-
-  def self.options
-    select_all_sql("SELECT id, name FROM pools WHERE is_active = true AND is_deleted = false ORDER BY name LIMIT 100").map {|x| [x["name"].tr("_", " "), x["id"]]}
-  end
-
-  def self.create_anonymous
-    Pool.new do |pool|
-      pool.name = "TEMP:#{Time.now.to_f}.#{rand(1_000_000)}"
-      pool.save
-      pool.name = "anon:#{pool.id}"
-      pool.save
-    end
-  end
-
   def self.normalize_name(name)
-    name.gsub(/\s+/, "_")
+    name.gsub(/[_[:space:]]+/, "_").gsub(/\A_|_\z/, "")
+  end
+
+  def self.normalize_name_for_search(name)
+    normalize_name(name).mb_chars.downcase
   end
 
   def self.normalize_post_ids(post_ids, unique)
@@ -149,9 +123,9 @@ class Pool < ActiveRecord::Base
 
   def self.find_by_name(name)
     if name =~ /^\d+$/
-      where("id = ?", name.to_i).first
+      where("pools.id = ?", name.to_i).first
     elsif name
-      where("lower(name) = ?", normalize_name(name).mb_chars.downcase).first
+      where("lower(pools.name) = ?", normalize_name_for_search(name)).first
     else
       nil
     end
@@ -176,10 +150,6 @@ class Pool < ActiveRecord::Base
   def initialize_is_active
     self.is_deleted = false if is_deleted.nil?
     self.is_active = true if is_active.nil?
-  end
-
-  def initialize_creator
-    self.creator_id = CurrentUser.id
   end
 
   def normalize_name
@@ -210,7 +180,6 @@ class Pool < ActiveRecord::Base
     self.post_ids = version.post_ids.join(" ")
     self.name = version.name
     self.description = version.description
-
     synchronize!
   end
 
@@ -223,38 +192,47 @@ class Pool < ActiveRecord::Base
   end
 
   def deletable_by?(user)
-    user.is_moderator?
+    user.is_builder?
+  end
+
+  def updater_can_edit_deleted
+    if is_deleted? && !deletable_by?(CurrentUser.user)
+      errors[:base] << "You cannot update pools that are deleted"
+      false
+    else
+      true
+    end
   end
 
   def create_mod_action_for_delete
-    ModAction.log("deleted pool ##{id} (name: #{name})")
+    ModAction.log("deleted pool ##{id} (name: #{name})",:pool_delete)
   end
 
   def create_mod_action_for_undelete
-    ModAction.log("undeleted pool ##{id} (name: #{name})")
-  end
-
-  def create_mod_action_for_destroy
-    ModAction.log("permanently deleted pool ##{id} name=#{name} post_ids=#{post_ids}")
+    ModAction.log("undeleted pool ##{id} (name: #{name})",:pool_undelete)
   end
 
   def add!(post)
     return if contains?(post.id)
     return if is_deleted?
 
-    update_attributes(:post_ids => add_number_to_string(post.id, post_ids), :post_count => post_count + 1)
-    post.add_pool!(self, true)
-    clear_post_id_array
+    with_lock do
+      update_attributes(:post_ids => add_number_to_string(post.id, post_ids), :post_count => post_count + 1)
+      post.add_pool!(self, true)
+      clear_post_id_array
+    end
   end
 
   def remove!(post)
     return unless contains?(post.id)
     return unless CurrentUser.user.can_remove_from_pools?
-    return if is_deleted?
 
-    update_attributes(:post_ids => remove_number_from_string(post.id, post_ids), :post_count => post_count - 1)
-    post.remove_pool!(self, true)
-    clear_post_id_array
+    with_lock do
+      reload
+      update_attributes(:post_ids => remove_number_from_string(post.id, post_ids), :post_count => post_count - 1)
+      post.remove_pool!(self)
+      clear_post_id_array
+    end
   end
 
   def add_number_to_string(number, string)
@@ -293,7 +271,7 @@ class Pool < ActiveRecord::Base
 
     removed.each do |post_id|
       post = Post.find(post_id)
-      post.remove_pool!(self, true)
+      post.remove_pool!(self)
     end
 
     normalize_post_ids
@@ -303,7 +281,7 @@ class Pool < ActiveRecord::Base
 
   def synchronize!
     synchronize
-    save if post_ids_changed?
+    save if will_save_change_to_post_ids?
   end
 
   def post_id_array
@@ -313,15 +291,18 @@ class Pool < ActiveRecord::Base
   def post_id_array=(array)
     self.post_ids = array.join(" ")
     clear_post_id_array
+    self
   end
 
   def post_id_array_was
-    @post_id_array_was ||= post_ids_was.scan(/\d+/).map(&:to_i)
+    old_post_ids = post_ids_before_last_save || post_ids_was
+    @post_id_array_was ||= old_post_ids.to_s.scan(/\d+/).map(&:to_i)
   end
 
   def clear_post_id_array
     @post_id_array = nil
     @post_id_array_was = nil
+    self
   end
 
   def neighbors(post)
@@ -360,18 +341,15 @@ class Pool < ActiveRecord::Base
     super
     @neighbor_posts = nil
     clear_post_id_array
+    self
   end
 
   def method_attributes
     super + [:creator_name]
   end
 
-  def strip_name
-    self.name = name.to_s.strip
-  end
-
   def update_category_pseudo_tags_for_posts_async
-    if category_changed?
+    if saved_change_to_category?
       delay(:queue => "default").update_category_pseudo_tags_for_posts
     end
   end
@@ -389,7 +367,7 @@ class Pool < ActiveRecord::Base
   end
 
   def updater_can_change_category
-    if category_changed? && !category_changeable_by?(CurrentUser.user)
+    if saved_change_to_category? && !category_changeable_by?(CurrentUser.user)
       errors[:base] << "You cannot change the category of pools with greater than 100 posts"
       false
     else
@@ -397,12 +375,18 @@ class Pool < ActiveRecord::Base
     end
   end
 
-  def name_does_not_conflict_with_metatags
-    if %w(any none series collection).include?(name.downcase.tr(" ", "_"))
-      errors[:base] << "Pools cannot have the following names: any, none, series, collection"
-      false
-    else
-      true
+  def validate_name
+    case name
+    when /\A(any|none|series|collection)\z/i
+      errors[:name] << "cannot be any of the following names: any, none, series, collection"
+    when /,/
+      errors[:name] << "cannot contain commas"
+    when /\*/
+      errors[:name] << "cannot contain asterisks"
+    when ""
+      errors[:name] << "cannot be blank"
+    when /\A[0-9]+\z/
+      errors[:name] << "cannot contain only digits"
     end
   end
 

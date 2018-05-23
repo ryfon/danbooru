@@ -1,6 +1,13 @@
 require 'digest/sha1'
 
-class Dmail < ActiveRecord::Base
+class Dmail < ApplicationRecord
+  # if a person sends spam to more than 10 users within a 24 hour window, automatically ban them for 3 days.
+  AUTOBAN_THRESHOLD = 10
+  AUTOBAN_WINDOW = 24.hours
+  AUTOBAN_DURATION = 3
+
+  include Rakismet::Model
+
   with_options on: :create do
     validates_presence_of :to_id
     validates_presence_of :from_id
@@ -16,7 +23,42 @@ class Dmail < ActiveRecord::Base
   after_initialize :initialize_attributes, if: :new_record?
   before_create :auto_read_if_filtered
   after_create :update_recipient
-  after_create :send_dmail
+  after_commit :send_email, on: :create
+
+  rakismet_attrs author: :from_name, author_email: :from_email, content: :title_and_body, user_ip: :creator_ip_addr_str
+
+  concerning :SpamMethods do
+    class_methods do
+      def is_spammer?(user)
+        return false if user.is_gold?
+
+        spammed_users = sent_by(user).where(is_spam: true).where("created_at > ?", AUTOBAN_WINDOW.ago).distinct.count(:to_id)
+        spammed_users >= AUTOBAN_THRESHOLD
+      end
+
+      def ban_spammer(spammer)
+        spammer.bans.create! do |ban|
+          ban.banner = User.system
+          ban.reason = "Spambot."
+          ban.duration = AUTOBAN_DURATION
+        end
+      end
+    end
+
+    def title_and_body
+      "#{title}\n\n#{body}"
+    end
+
+    def creator_ip_addr_str
+      creator_ip_addr.to_s
+    end
+
+    def spam?
+      return false if Danbooru.config.rakismet_key.blank?
+      return false if from.is_gold?
+      super()
+    end
+  end
 
   module AddressMethods
     def to_name
@@ -25,6 +67,10 @@ class Dmail < ActiveRecord::Base
 
     def from_name
       User.id_to_pretty_name(from_id)
+    end
+
+    def from_email
+      from.email
     end
 
     def to_name=(name)
@@ -48,6 +94,7 @@ class Dmail < ActiveRecord::Base
           # recipient's copy
           copy = Dmail.new(params)
           copy.owner_id = copy.to_id
+          copy.is_spam = copy.spam?
           copy.save unless copy.to_id == copy.from_id
 
           # sender's copy
@@ -55,13 +102,20 @@ class Dmail < ActiveRecord::Base
           copy.owner_id = copy.from_id
           copy.is_read = true
           copy.save
+
+          Dmail.ban_spammer(copy.from) if Dmail.is_spammer?(copy.from)
         end
 
         copy
       end
 
       def create_automated(params)
-        create_split(from: Danbooru.config.system_user, **params)
+        CurrentUser.as_system do
+          dmail = Dmail.new(from: User.system, **params)
+          dmail.owner = dmail.to
+          dmail.save
+          dmail
+        end
       end
     end
 
@@ -91,12 +145,21 @@ class Dmail < ActiveRecord::Base
   end
   
   module SearchMethods
+    def sent_by(user)
+      where("dmails.from_id = ? AND dmails.owner_id != ?", user.id, user.id)
+    end
+
     def active
       where("is_deleted = ?", false)
     end
 
     def deleted
       where("is_deleted = ?", true)
+    end
+
+    def title_matches(query)
+      query = "*#{query}*" unless query =~ /\*/
+      where("lower(dmails.title) LIKE ?", query.mb_chars.downcase.to_escaped_for_sql_like)
     end
 
     def search_message(query)
@@ -106,6 +169,10 @@ class Dmail < ActiveRecord::Base
       else
         where("message_index @@ plainto_tsquery(?)", query.to_escaped_for_tsquery_split)
       end
+    end
+
+    def read
+      where(is_read: true)
     end
 
     def unread
@@ -125,8 +192,11 @@ class Dmail < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
+
+      if params[:title_matches].present?
+        q = q.title_matches(params[:title_matches])
+      end
 
       if params[:message_matches].present?
         q = q.search_message(params[:message_matches])
@@ -148,13 +218,15 @@ class Dmail < ActiveRecord::Base
         q = q.where("from_id = ?", params[:from_id].to_i)
       end
 
-      if params[:read] == "true"
-        q = q.where("is_read = true")
-      elsif params[:read] == "false"
-        q = q.unread
-      end
+      params[:is_spam] = false unless params[:is_spam].present?
+      q = q.attribute_matches(:is_spam, params[:is_spam])
+      q = q.attribute_matches(:is_read, params[:is_read])
+      q = q.attribute_matches(:is_deleted, params[:is_deleted])
 
-      q
+      q = q.read if params[:read].to_s.truthy?
+      q = q.unread if params[:read].to_s.falsy?
+
+      q.apply_default_order(params)
     end
   end
 
@@ -165,7 +237,7 @@ class Dmail < ActiveRecord::Base
 
   def validate_sender_is_not_banned
     if from.is_banned?
-      errors[:base] = "Sender is banned and cannot send messages"
+      errors[:base] << "Sender is banned and cannot send messages"
       return false
     else
       return true
@@ -176,22 +248,21 @@ class Dmail < ActiveRecord::Base
     "[quote]\n#{from_name} said:\n\n#{body}\n[/quote]\n\n"
   end
 
-  def send_dmail
-    if to.receive_email_notifications? && to.email =~ /@/ && owner_id == to.id
+  def send_email
+    if !is_spam? && to.receive_email_notifications? && to.email =~ /@/ && owner_id == to.id
       UserMailer.dmail_notice(self).deliver_now
     end
   end
 
   def mark_as_read!
     update_column(:is_read, true)
-
-    unless Dmail.where(:is_read => false, :owner_id => CurrentUser.user.id).exists?
-      CurrentUser.user.update_attribute(:has_mail, false)
+    owner.dmails.unread.count.tap do |unread_count|
+      owner.update(has_mail: (unread_count > 0), unread_dmail_count: unread_count)
     end
   end
 
   def is_automated?
-    from == Danbooru.config.system_user
+    from == User.system
   end
 
   def filtered?
@@ -206,17 +277,16 @@ class Dmail < ActiveRecord::Base
 
   def update_recipient
     if owner_id != CurrentUser.user.id && !is_deleted? && !is_read?
-      to.update_attribute(:has_mail, true)
+      to.update(has_mail: true, unread_dmail_count: to.dmails.unread.count)
     end
   end
   
   def key
-    digest = OpenSSL::Digest.new("sha256")
-    OpenSSL::HMAC.hexdigest(digest, Danbooru.config.email_key, "#{title} #{body}")
+    verifier = ActiveSupport::MessageVerifier.new(Danbooru.config.email_key, serializer: JSON, digest: "SHA256")
+    verifier.generate("#{title} #{body}")
   end
   
   def visible_to?(user, key)
     owner_id == user.id || (user.is_moderator? && key == self.key)
   end
-
 end

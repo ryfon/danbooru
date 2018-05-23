@@ -1,4 +1,4 @@
-﻿# encoding: UTF-8
+# encoding: UTF-8
 
 require 'csv'
 
@@ -11,13 +11,14 @@ module Sources
       TIMESTAMP = '(?:[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{2}/[0-9]{2}/[0-9]{2})'
       EXT = "(?:jpg|jpeg|png|gif)"
 
-      WEB =   "^(?:https?://)?www\\.pixiv\\.net"
-      I12 =   "^(?:https?://)?i[0-9]+\\.pixiv\\.net"
-      IMG =   "^(?:https?://)?img[0-9]*\\.pixiv\\.net"
-      TOUCH = "^(?:https?://)?touch\\.pixiv\\.net"
+      WEB =   '(?:\A(?:https?://)?www\.pixiv\.net)'
+      I12 =   '(?:\A(?:https?://)?i[0-9]+\.pixiv\.net)'
+      IMG =   '(?:\A(?:https?://)?img[0-9]*\.pixiv\.net)'
+      PXIMG = '(?:\A(?:https?://)?i\.pximg\.net)'
+      TOUCH = '(?:\A(?:https?://)?touch\.pixiv\.net)'
 
       def self.url_match?(url)
-        url =~ /#{WEB}|#{IMG}|#{I12}|#{TOUCH}/i
+        url =~ /#{WEB}|#{IMG}|#{I12}|#{TOUCH}|#{PXIMG}/i
       end
 
       def referer_url
@@ -40,12 +41,8 @@ module Sources
         "http://www.pixiv.net"
       end
 
-      def has_artist_commentary?
-        @artist_commentary_desc.present?
-      end
-
       def normalized_for_artist_finder?
-        url =~ %r!https?://img\.pixiv\.net/img/#{MONIKER}/?$!i
+        url =~ %r!\Ahttp://www\.pixiv\.net/member\.php\?id=[0-9]+\z/!
       end
 
       def normalizable_for_artist_finder?
@@ -53,15 +50,21 @@ module Sources
       end
 
       def normalize_for_artist_finder!
-        if has_moniker?
-          moniker = get_moniker_from_url
-        else
-          @illust_id = illust_id_from_url!
-          @metadata = get_metadata_from_papi(@illust_id)
-          moniker = @metadata.moniker
+        @illust_id = illust_id_from_url!
+        @metadata = get_metadata_from_papi(@illust_id)
+
+        "http://www.pixiv.net/member.php?id=#{@metadata.user_id}/"
+      end
+
+      def translate_tag(tag)
+        normalized_tag = tag.gsub(/\d+users入り\z/i, "")
+
+        translated_tags = super(normalized_tag)
+        if translated_tags.empty? && normalized_tag.include?("/")
+          translated_tags = normalized_tag.split("/").flat_map { |tag| super(tag) }
         end
 
-        "http://img.pixiv.net/img/#{moniker}/"
+        translated_tags
       end
 
       def get
@@ -78,18 +81,21 @@ module Sources
           page = agent.get(URI.parse(normalized_url))
         end
         
-        @artist_name, @profile_url = get_profile_from_page(page)
-        @pixiv_moniker = get_moniker_from_page(page)
+        @artist_name = @metadata.name
+        @profile_url = "http://www.pixiv.net/member.php?id=#{@metadata.user_id}"
+        @pixiv_moniker = @metadata.moniker
         @zip_url, @ugoira_frame_data, @ugoira_content_type = get_zip_url_from_page(page)
-        @tags = get_tags_from_page(page)
-        @page_count = get_page_count_from_page(page)
+        @tags = @metadata.tags.map do |tag|
+          [tag, "https://www.pixiv.net/search.php?s_mode=s_tag_full&#{{word: tag}.to_param}"]
+        end
+        @page_count = @metadata.page_count
         @artist_commentary_title = @metadata.artist_commentary_title
         @artist_commentary_desc = @metadata.artist_commentary_desc
 
         is_manga = @page_count > 1
 
         if !@zip_url
-          @image_url = get_image_url_from_page(page, is_manga)
+          @image_url = image_urls.first
         end
       end
 
@@ -112,6 +118,24 @@ module Sources
         @metadata.pages
       end
 
+      def self.to_dtext(text)
+        text = text.gsub(%r!https?://www\.pixiv\.net/member_illust\.php\?mode=medium&illust_id=([0-9]+)!i) do |match|
+          pixiv_id = $1
+          %(pixiv ##{pixiv_id} "»":[/posts?tags=pixiv:#{pixiv_id}])
+        end
+
+        text = text.gsub(%r!https?://www\.pixiv\.net/member\.php\?id=([0-9]+)!i) do |match|
+          member_id = $1
+          profile_url = "https://www.pixiv.net/member.php?id=#{member_id}"
+          search_params = {"search[url_matches]" => profile_url}.to_param
+
+          %("user/#{member_id}":[#{profile_url}] "»":[/artists?#{search_params}])
+        end
+
+        text = text.gsub(/\r\n|\r|\n/, "<br>")
+        DText.from_html(text)
+      end
+
       def illust_id_from_url
         if sample_image? || full_image? || work_page?
           illust_id_from_url!
@@ -119,6 +143,7 @@ module Sources
           nil
         end
       rescue Sources::Error
+        raise if Rails.env.test?
         nil
       end
 
@@ -159,8 +184,12 @@ module Sources
 
       # http://i1.pixiv.net/c/600x600/img-master/img/2014/10/02/13/51/23/46304396_p1_master1200.jpg
       # => http://i1.pixiv.net/img-original/img/2014/10/02/13/51/23/46304396_p1.png
+      #
+      # http://i.pximg.net/img-master/img/2014/05/15/23/53/59/43521009_p1_master1200.jpg
+      # => http://i.pximg.net/img-original/img/2014/05/15/23/53/59/43521009_p1.jpg
       def rewrite_new_medium_images(thumbnail_url)
-        if thumbnail_url =~ %r!/c/\d+x\d+/img-master/img/#{TIMESTAMP}/\d+_p\d+_\w+\.jpg!i
+        if thumbnail_url =~ %r!/c/\d+x\d+/img-master/img/#{TIMESTAMP}/\d+_p\d+_\w+\.jpg!i ||
+           thumbnail_url =~ %r!/img-master/img/#{TIMESTAMP}/\d+_p\d+_\w+\.jpg!i
           page = manga_page_from_url(@url).to_i
           thumbnail_url = @metadata.pages[page]
         end
@@ -222,29 +251,6 @@ module Sources
         end
       end
 
-      def get_profile_from_page(page)
-        profile_url = page.search("a.user-link").first
-        if profile_url
-          profile_url = "http://www.pixiv.net" + profile_url["href"]
-        end
-
-        artist_name = page.search("h1.user").first
-        if artist_name
-          artist_name = artist_name.inner_text
-        end
-
-        return [artist_name, profile_url]
-      end
-
-      def get_moniker_from_page(page)
-        # <a class="tab-feed" href="/stacc/gennmai-226">Feed</a>
-        stacc_link = page.search("a.tab-feed").first
-
-        if not stacc_link.nil?
-          stacc_link.attr("href").sub(%r!^/stacc/!i, '')
-        end
-      end
-
       def get_moniker_from_url
         case url
         when %r!#{IMG}/img/(#{MONIKER})!i
@@ -297,43 +303,6 @@ module Sources
         end
       end
 
-      def get_tags_from_page(page)
-        # puts page.root.to_xhtml
-
-        links = page.search("ul.tags a.text").find_all do |node|
-          node["href"] =~ /search\.php/
-        end
-
-        original_flag = page.search("a.original-works")
-
-        if links.any?
-          links.map! do |node|
-            [node.inner_text, "http://www.pixiv.net" + node.attr("href")]
-          end
-
-          if original_flag.any?
-            links << ["オリジナル", "http://www.pixiv.net/search.php?s_mode=s_tag_full&word=%E3%82%AA%E3%83%AA%E3%82%B8%E3%83%8A%E3%83%AB"]
-          end
-
-          links
-        else
-          []
-        end
-      end
-
-      def get_page_count_from_page(page)
-        elements = page.search("ul.meta li").find_all do |node|
-          node.text =~ /Manga|漫画|複数枚投稿|Multiple images/
-        end
-
-        if elements.any?
-          elements[0].text =~ /(?:Manga|漫画|複数枚投稿|Multiple images):? (\d+)P/
-          $1.to_i
-        else
-          1
-        end
-      end
-
       def normalized_url
         "http://www.pixiv.net/member_illust.php?mode=medium&illust_id=#{@illust_id}"
       end
@@ -343,7 +312,7 @@ module Sources
       end
 
       def work_page?
-        return true if url =~ %r!(?:#{WEB}|#{TOUCH})/member_illust\.php\?mode=(?:medium|big|manga|manga_big)&illust_id=\d+!i
+        return true if url =~ %r!(?:#{WEB}|#{TOUCH})/member_illust\.php! && url =~ %r!mode=(?:medium|big|manga|manga_big)! && url =~ %r!illust_id=\d+!
         return true if url =~ %r!(?:#{WEB}|#{TOUCH})/i/\d+$!i
         return false
       end
@@ -359,8 +328,11 @@ module Sources
         # http://i1.pixiv.net/img-original/img/2014/10/02/13/51/23/46304396_p0.png
         return true if url =~ %r!#{I12}/img-original/img/#{TIMESTAMP}/\d+_p\d+\.#{EXT}$!i
 
+        # http://i.pximg.net/img-original/img/2017/03/22/17/40/51/62041488_p0.jpg
+        return true if url =~ %r!#{PXIMG}/img-original/img/#{TIMESTAMP}/\d+_\w+\.#{EXT}!i
+
         # http://i1.pixiv.net/img-zip-ugoira/img/2014/10/03/17/29/16/46323924_ugoira1920x1080.zip
-        return true if url =~ %r!#{I12}/img-zip-ugoira/img/#{TIMESTAMP}/\d+_ugoira\d+x\d+\.zip$!i
+        return true if url =~ %r!(#{I12}|#{PXIMG})/img-zip-ugoira/img/#{TIMESTAMP}/\d+_ugoira\d+x\d+\.zip$!i
 
         return false
       end
@@ -376,6 +348,12 @@ module Sources
         # http://i1.pixiv.net/c/600x600/img-master/img/2014/10/02/13/51/23/46304396_p0_master1200.jpg
         # http://i2.pixiv.net/c/64x64/img-master/img/2014/10/09/12/59/50/46441917_square1200.jpg
         return true if url =~ %r!#{I12}/c/\d+x\d+/img-master/img/#{TIMESTAMP}/\d+_\w+\.#{EXT}$!i
+
+        # http://i.pximg.net/img-master/img/2014/05/15/23/53/59/43521009_p1_master1200.jpg
+        return true if url =~ %r!#{PXIMG}/img-master/img/#{TIMESTAMP}/\d+_\w+\.#{EXT}!i
+
+        # http://i.pximg.net/c/600x600/img-master/img/2017/03/22/17/40/51/62041488_p0_master1200.jpg
+        return true if url =~ %r!#{PXIMG}/c/\d+x\d+/img-master/img/#{TIMESTAMP}/\d+_\w+\.#{EXT}!i
 
         # http://i1.pixiv.net/img-inf/img/2011/05/01/23/28/04/18557054_s.png
         # http://i2.pixiv.net/img-inf/img/2010/11/30/08/54/06/14901765_64x64.jpg

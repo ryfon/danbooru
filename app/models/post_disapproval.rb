@@ -1,19 +1,27 @@
-class PostDisapproval < ActiveRecord::Base
+class PostDisapproval < ApplicationRecord
   DELETION_THRESHOLD = 1.month
 
-  belongs_to :post
+  belongs_to :post, required: true
   belongs_to :user
+  after_initialize :initialize_attributes, if: :new_record?
   validates_uniqueness_of :post_id, :scope => [:user_id], :message => "have already hidden this post"
-  attr_accessible :post_id, :post, :user_id, :user, :reason, :message
   validates_inclusion_of :reason, :in => %w(legacy breaks_rules poor_quality disinterest)
 
-  scope :with_message, lambda {where("message is not null and message <> ''")}
-  scope :breaks_rules, lambda {where(:reason => "breaks_rules")}
-  scope :poor_quality, lambda {where(:reason => "poor_quality")}
-  scope :disinterest, lambda {where(:reason => ["disinterest", "legacy"])}
+  scope :with_message, -> {where("message is not null and message <> ''")}
+  scope :breaks_rules, -> {where(:reason => "breaks_rules")}
+  scope :poor_quality, -> {where(:reason => "poor_quality")}
+  scope :disinterest, -> {where(:reason => ["disinterest", "legacy"])}
+
+  def initialize_attributes
+    self.user_id ||= CurrentUser.user.id
+  end
+
+  def initialize_attributes
+    self.user_id ||= CurrentUser.user.id
+  end
 
   def self.prune!
-    PostDisapproval.destroy_all(["created_at < ?", DELETION_THRESHOLD.ago])
+    PostDisapproval.where("post_id in (select _.post_id from post_disapprovals _ where _.created_at < ?)", DELETION_THRESHOLD.ago).delete_all
   end
 
   def self.dmail_messages!
@@ -28,7 +36,7 @@ class PostDisapproval < ActiveRecord::Base
 
       Dmail.create_automated(
         :to_id => uploader.id,
-        :title => "Some of your uploads have been critiqued by the moderators",
+        :title => "Someone has commented on your uploads",
         :body => message
       )
     end

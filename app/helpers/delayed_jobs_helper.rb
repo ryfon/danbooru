@@ -13,9 +13,6 @@ module DelayedJobsHelper
     when "Moderator::TagBatchChange"
       "<strong>tag batch change</strong>"
 
-    when "TagSubscription.process"
-      "<strong>process tag subscription</strong>"
-
     when "Class#expire_cache"
       "<strong>expire post count cache</strong>"
 
@@ -40,9 +37,6 @@ module DelayedJobsHelper
     when "Tag#update_category_post_counts"
       "<strong>update category post counts</strong>"
 
-    when "Class#process"
-      "<strong>update tag subscription</strong>"
-
     when "Class#remove_iqdb"
       "<strong>remove from iqdb</strong>"
 
@@ -61,6 +55,15 @@ module DelayedJobsHelper
     when "Pool#update_category_pseudo_tags_for_posts"
       "<strong>update pool category pseudo tags for posts</strong>"
 
+    when "Post.delete_files"
+      "<strong>delete old files</strong>"
+
+    when "BulkRevert#process"
+      "<strong>bulk revert</strong>"
+
+    when "PostKeeperManager.check_and_update"
+      "<strong>update top tagger</strong>"
+
     else
       h(job.name)
     end
@@ -68,6 +71,9 @@ module DelayedJobsHelper
 
   def print_handler(job)
     case job.name
+    when "PostKeeperManager.check_and_assign"
+      ""
+
     when "Tag.increment_post_counts", "Tag.decrement_post_counts"
       ""
 
@@ -76,9 +82,6 @@ module DelayedJobsHelper
 
     when "Moderator::TagBatchChange"
       h(job.payload_object.antecedent) + " -> " + h(job.payload_object.consequent)
-
-    when "TagSubscription.process"
-      ""
 
     when "Class#expire_cache"
       h(job.payload_object.args.flatten.join(" "))
@@ -122,8 +125,14 @@ module DelayedJobsHelper
     when "Pool#update_category_pseudo_tags_for_posts"
       %{<a href="/pools/#{job.payload_object.id}">#{h(job.payload_object.name)}</a>}
 
-    else
-      h(job.handler)
+    when "Post.delete_files"
+      %{<a href="/posts/#{job.payload_object.args.first}">post ##{job.payload_object.args.first}</a>}
+
+    when "BulkRevert#process"
+      h(job.payload_object.args.join(" "))
+
+    when "PostKeeperManager.check_and_update"
+      h(job.payload_object.args[0])
     end
   end
 end

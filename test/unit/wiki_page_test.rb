@@ -2,7 +2,6 @@ require 'test_helper'
 
 class WikiPageTest < ActiveSupport::TestCase
   setup do
-    MEMCACHE.flush_all
     CurrentUser.ip_addr = "127.0.0.1"
   end
 
@@ -14,17 +13,17 @@ class WikiPageTest < ActiveSupport::TestCase
   context "A wiki page" do
     context "that is locked" do
       should "not be editable by a member" do
-        CurrentUser.user = FactoryGirl.create(:moderator_user)
-        @wiki_page = FactoryGirl.create(:wiki_page, :is_locked => true)
-        CurrentUser.user = FactoryGirl.create(:user)
+        CurrentUser.user = FactoryBot.create(:moderator_user)
+        @wiki_page = FactoryBot.create(:wiki_page, :is_locked => true)
+        CurrentUser.user = FactoryBot.create(:user)
         @wiki_page.update_attributes(:body => "hello")
         assert_equal(["Is locked and cannot be updated"], @wiki_page.errors.full_messages)
       end
 
       should "be editable by a moderator" do
-        CurrentUser.user = FactoryGirl.create(:moderator_user)
-        @wiki_page = FactoryGirl.create(:wiki_page, :is_locked => true)
-        CurrentUser.user = FactoryGirl.create(:moderator_user)
+        CurrentUser.user = FactoryBot.create(:moderator_user)
+        @wiki_page = FactoryBot.create(:wiki_page, :is_locked => true)
+        CurrentUser.user = FactoryBot.create(:moderator_user)
         @wiki_page.update_attributes(:body => "hello")
         assert_equal([], @wiki_page.errors.full_messages)
       end
@@ -32,9 +31,9 @@ class WikiPageTest < ActiveSupport::TestCase
 
     context "updated by a moderator" do
       setup do
-        @user = FactoryGirl.create(:moderator_user)
+        @user = FactoryBot.create(:moderator_user)
         CurrentUser.user = @user
-        @wiki_page = FactoryGirl.create(:wiki_page)
+        @wiki_page = FactoryBot.create(:wiki_page)
       end
 
       should "allow the is_locked attribute to be updated" do
@@ -46,14 +45,14 @@ class WikiPageTest < ActiveSupport::TestCase
 
     context "updated by a regular user" do
       setup do
-        @user = FactoryGirl.create(:user)
+        @user = FactoryBot.create(:user)
         CurrentUser.user = @user
-        @wiki_page = FactoryGirl.create(:wiki_page, :title => "HOT POTATO")
+        @wiki_page = FactoryBot.create(:wiki_page, :title => "HOT POTATO", :other_names => "foo*bar baz")
       end
 
       should "not allow the is_locked attribute to be updated" do
         @wiki_page.update_attributes(:is_locked => true)
-        assert_equal(["Is locked can be modified by builders only", "Is locked and cannot be updated"], @wiki_page.errors.full_messages)
+        assert_equal(["Is locked and cannot be updated"], @wiki_page.errors.full_messages)
         @wiki_page.reload
         assert_equal(false, @wiki_page.is_locked?)
       end
@@ -62,15 +61,25 @@ class WikiPageTest < ActiveSupport::TestCase
         assert_equal("hot_potato", @wiki_page.title)
       end
 
+      should "normalize its other names" do
+        @wiki_page.update(:other_names => "foo*bar baz baz 加賀（艦これ）")
+        assert(%w[foo*bar baz 加賀(艦これ)], @wiki_page.other_names_array)
+      end
+
       should "search by title" do
         matches = WikiPage.titled("hot potato")
         assert_equal(1, matches.count)
         assert_equal("hot_potato", matches.first.title)
       end
 
+      should "search other names with wildcards" do
+        matches = WikiPage.search(other_names_match: "fo*")
+        assert_equal([@wiki_page.id], matches.map(&:id))
+      end
+
       should "create versions" do
         assert_difference("WikiPageVersion.count") do
-          @wiki_page = FactoryGirl.create(:wiki_page, :title => "xxx")
+          @wiki_page = FactoryBot.create(:wiki_page, :title => "xxx")
         end
 
         assert_difference("WikiPageVersion.count") do
@@ -93,7 +102,7 @@ class WikiPageTest < ActiveSupport::TestCase
       end
 
       should "differentiate between updater and creator" do
-        another_user = FactoryGirl.create(:user)
+        another_user = FactoryBot.create(:user)
         CurrentUser.scoped(another_user, "127.0.0.1") do
           @wiki_page.title = "yyy"
           @wiki_page.save

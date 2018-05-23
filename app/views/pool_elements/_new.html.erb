@@ -3,12 +3,12 @@
 
   <div class="input">
     <label>Pool Name</label>
-    <span id="pool-name-container"><%= text_field_tag "pool_name", "", :size => 20 %></span>
+    <span id="pool-name-container"><%= text_field_tag "pool_name", "", :size => 20, :data => { autocomplete: "pool" } %></span>
     <span id="pool-name-hint" class="hint">Search for a pool containing (<%= link_to "see full list", all_select_pool_element_path, :remote => true %>)</span>
   </div>
 
   <div class="input">
-    <%= submit_tag "Submit", :data => { :disable_with => "Submitting..." } %>
+    <%= submit_tag "Submit" %>
   </div>
 <% end %>
 
@@ -17,7 +17,7 @@
     <h1>Recent Pools</h1>
     <ul id="recent-pools">
       <% recent_updated_pools.each do |pool| %>
-        <li><%= pool.pretty_name %></li>
+        <%= content_tag :li, pool.pretty_name, "data-value" => pool.name %>
       <% end %>
     </ul>
   </div>

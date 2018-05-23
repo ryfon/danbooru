@@ -29,12 +29,21 @@ module PostSets
       is_single_tag? && ::WikiPage.titled(tag_string).exists? && wiki_page.visible?
     end
 
+    def has_blank_wiki?
+      is_simple_tag? && !has_wiki?
+    end
+
     def wiki_page
       if is_single_tag?
         ::WikiPage.titled(tag_string).first
       else
         nil
       end
+    end
+
+    def tag
+      return nil if !is_single_tag?
+      @tag ||= Tag.find_by(name: Tag.normalize_name(tag_string))
     end
 
     def has_artist?
@@ -75,6 +84,22 @@ module PostSets
 
     def has_explicit?
       posts.any? {|x| x.rating == "e"}
+    end
+
+    def hidden_posts
+      posts.select { |p| !p.visible? }
+    end
+
+    def banned_posts
+      posts.select { |p| p.banblocked? }
+    end
+
+    def censored_posts
+      posts.select { |p| p.levelblocked? && !p.banblocked? }
+    end
+
+    def safe_posts
+      posts.select { |p| p.safeblocked? && !p.levelblocked? && !p.banblocked? }
     end
 
     def use_sequential_paginator?
@@ -121,20 +146,15 @@ module PostSets
     end
 
     def hide_from_crawler?
-      return true if !is_single_tag?
-      return true if is_pattern_search?
-      return true if page.to_i > 1
-      return true if is_metatag_search?
-      false
-    end
-
-    def is_metatag_search?
-      # filter out some common metatags
-      tag_string =~ /(?:rating|user|fav|status|order|source|score|width|height):/
+      !is_simple_tag? || page.to_i > 1
     end
 
     def is_single_tag?
       tag_array.size == 1
+    end
+
+    def is_simple_tag?
+      Tag.is_simple_tag?(tag_string)
     end
 
     def is_empty_tag?
@@ -149,20 +169,8 @@ module PostSets
       [page.to_i, 1].max
     end
 
-    def is_tag_subscription?
-      tag_subscription.present?
-    end
-
     def is_saved_search?
       tag_string =~ /search:/
-    end
-
-    def tag_subscription
-      @tag_subscription ||= tag_array.select {|x| x =~ /^sub:/}.map {|x| x.sub(/^sub:/, "")}.first
-    end
-
-    def tag_subscription_tags
-      @tag_subscription_tags ||= TagSubscription.find_tags(tag_subscription)
     end
 
     def presenter

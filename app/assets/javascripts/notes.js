@@ -137,6 +137,15 @@ Danbooru.Note = {
       return $("#note-container div.note-box[data-id=" + id + "]");
     },
 
+    show_highlighted: function($note_box) {
+      var note_id = $note_box.data("id");
+
+      Danbooru.Note.Body.show(note_id);
+      $(".note-box-highlighted").removeClass("note-box-highlighted");
+      $note_box.addClass("note-box-highlighted");
+      Danbooru.scroll_to($note_box);
+    },
+
     resize_inner_border: function($note_box) {
       var $inner_border = $note_box.find("div.note-box-inner-border");
       $inner_border.css({
@@ -176,6 +185,9 @@ Danbooru.Note = {
 
     scale_all: function() {
       var container = document.getElementById('note-container');
+      if (container === null) {
+        return;
+      }
       // Hide notes while rescaling, to prevent unnecessary reflowing
       var was_visible = container.style.display != 'none';
       if (was_visible) {
@@ -358,6 +370,8 @@ Danbooru.Note = {
 
   Edit: {
     show: function($note_body) {
+      var id = $note_body.data("id");
+
       if (Danbooru.Note.editing) {
         return;
       }
@@ -382,7 +396,7 @@ Danbooru.Note = {
 
       $dialog = $('<div></div>');
       $dialog.append($textarea);
-      $dialog.data("id", $note_body.data("id"));
+      $dialog.data("id", id);
       $dialog.dialog({
         width: 360,
         height: 210,
@@ -391,7 +405,9 @@ Danbooru.Note = {
           at: "right-20",
           of: window
         },
-        dialogClass: "note-edit-dialog",
+        classes: {
+          "ui-dialog": "note-edit-dialog",
+        },
         title: "Edit note",
         buttons: {
           "Save": Danbooru.Note.Edit.save,
@@ -404,7 +420,7 @@ Danbooru.Note = {
       $dialog.data("uiDialog")._title = function(title) {
         title.html(this.options.title); // Allow unescaped html in dialog title
       }
-      $dialog.dialog("option", "title", 'Edit note (<a href="/wiki_pages/help:notes">view help</a>)');
+      $dialog.dialog("option", "title", 'Edit note #' + id + ' (<a href="/wiki_pages/help:notes">view help</a>)');
 
       $dialog.on("dialogclose", function() {
         Danbooru.Note.editing = false;
@@ -432,19 +448,19 @@ Danbooru.Note = {
           width: $note_box.width() / ratio,
           height: $note_box.height() / ratio,
           body: $note_body.data("original-body"),
-          post_id: Danbooru.meta("post-id")
         }
       }
 
       if ($note_box.data("id").match(/x/)) {
         hash.note.html_id = $note_box.data("id");
+        hash.note.post_id = Danbooru.meta("post-id");
       }
 
       return hash;
     },
 
     error_handler: function(xhr, status, exception) {
-      Danbooru.error("There was an error saving the note");
+      Danbooru.error("Error: " + (xhr.responseJSON.reason || xhr.responseJSON.reasons.join("; ")));
     },
 
     success_handler: function(data, status, xhr) {
@@ -469,7 +485,7 @@ Danbooru.Note = {
       var text = $textarea.val();
       $note_body.data("original-body", text);
       Danbooru.Note.Body.set_text($note_body, $note_box, "Loading...");
-      $.get("/note_previews.json", {body: text}).success(function(data) {
+      $.get("/note_previews.json", {body: text}).then(function(data) {
         Danbooru.Note.Body.set_text($note_body, $note_box, data.body);
         Danbooru.Note.Box.resize_inner_border($note_box);
         $note_body.show();
@@ -502,7 +518,7 @@ Danbooru.Note = {
       var $note_box = Danbooru.Note.Box.find(id);
       $note_box.find(".note-box-inner-border").addClass("unsaved");
       Danbooru.Note.Body.set_text($note_body, $note_box, "Loading...");
-      $.get("/note_previews.json", {body: text}).success(function(data) {
+      $.get("/note_previews.json", {body: text}).then(function(data) {
         Danbooru.Note.Body.set_text($note_body, $note_box, data.body);
         $note_body.show();
       });
@@ -775,17 +791,40 @@ Danbooru.Note = {
         Danbooru.Note.Box.resize_inner_border($(note_box));
       });
     }
-  }
-}
+  },
 
-$(function() {
-  if ($("#c-posts").length && $("#a-show").length && $("#image").length && !$("video#image").length) {
+  initialize_all: function() {
+    if ($("#c-posts #a-show #image").length == 0 || $("video#image").length) {
+      return;
+    }
+
+    Danbooru.Note.embed = (Danbooru.meta("post-has-embedded-notes") === "true");
+    Danbooru.Note.load_all();
+
+    this.initialize_shortcuts();
+    this.initialize_highlight();
+    $(window).on("hashchange", this.initialize_highlight);
+  },
+
+  initialize_shortcuts: function() {
     if ($("#note-locked-notice").length == 0) {
       $("#translate").click(Danbooru.Note.TranslationMode.toggle);
       Danbooru.keydown("n", "translation_mode", Danbooru.Note.TranslationMode.toggle);
     }
-    Danbooru.Note.embed = (Danbooru.meta("post-has-embedded-notes") === "true");
-    Danbooru.Note.load_all();
+
     $("#image").click(Danbooru.Note.Box.toggle_all);
-  }
+  },
+
+  initialize_highlight: function() {
+    var matches = window.location.hash.match(/^#note-(\d+)$/);
+
+    if (matches) {
+      var $note_box = Danbooru.Note.Box.find(matches[1]);
+      Danbooru.Note.Box.show_highlighted($note_box);
+    }
+  },
+}
+
+$(function() {
+  Danbooru.Note.initialize_all();
 });

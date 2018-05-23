@@ -1,5 +1,5 @@
-<div id="c-tag-implications">
-  <div id="a-request-new">
+<div id="c-tag-implication-requests">
+  <div id="a-new">
     <h1>Tag Implication Request</h1>
 
     <%= error_messages_for :tag_implication_request %>
@@ -9,12 +9,12 @@
     <%= form_tag(tag_implication_request_path, :class => "simple_form") do %>
       <div class="input">
         <label>From</label>
-        <%= text_field "tag_implication_request", "antecedent_name" %>
+        <%= text_field "tag_implication_request", "antecedent_name", :data => { :autocomplete => "tag" } %>
       </div>
 
       <div class="input">
         <label>To</label>
-        <%= text_field "tag_implication_request", "consequent_name" %>
+        <%= text_field "tag_implication_request", "consequent_name", :data => { :autocomplete => "tag" } %>
       </div>
 
       <div class="input">
@@ -30,14 +30,14 @@
       </div>
 
       <div class="input">
-        <%= submit_tag "Submit", :data => { :disable_with => "Submitting..." } %>
+        <%= submit_tag "Submit" %>
         <%= dtext_preview_button "tag_implication_request", "reason" %>
       </div>
     <% end %>
-
-    <%= render "tag_implications/secondary_links" %>
   </div>
 </div>
+
+<%= render "tag_implications/secondary_links" %>
 
 <% content_for(:page_title) do %>
   Tag Implication Request - <%= Danbooru.config.app_name %>

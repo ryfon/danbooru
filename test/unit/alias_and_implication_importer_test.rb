@@ -3,13 +3,27 @@ require 'test_helper'
 class AliasAndImplicationImporterTest < ActiveSupport::TestCase
   context "The alias and implication importer" do
     setup do
-      CurrentUser.user = FactoryGirl.create(:admin_user)
+      CurrentUser.user = FactoryBot.create(:admin_user)
       CurrentUser.ip_addr = "127.0.0.1"
     end
 
     teardown do
       CurrentUser.user = nil
       CurrentUser.ip_addr = nil
+    end
+
+    context "category command" do
+      setup do
+        @tag = Tag.find_or_create_by_name("hello")
+        @list = "category hello -> artist\n"
+        @importer = AliasAndImplicationImporter.new(@list, nil)
+      end
+
+      should "work" do
+        @importer.process!
+        @tag.reload
+        assert_equal(Tag.categories.value_for("artist"), @tag.category)
+      end
     end
 
     context "given a valid list" do
@@ -52,9 +66,9 @@ class AliasAndImplicationImporterTest < ActiveSupport::TestCase
     end
 
     should "rename an aliased tag's artist entry and wiki page" do
-      tag1 = FactoryGirl.create(:tag, :name => "aaa", :category => 1)
-      tag2 = FactoryGirl.create(:tag, :name => "bbb")
-      artist = FactoryGirl.create(:artist, :name => "aaa", :notes => "testing")
+      tag1 = FactoryBot.create(:tag, :name => "aaa", :category => 1)
+      tag2 = FactoryBot.create(:tag, :name => "bbb")
+      artist = FactoryBot.create(:artist, :name => "aaa", :notes => "testing")
       @importer = AliasAndImplicationImporter.new("create alias aaa -> bbb", "", "1")
       @importer.process!
       artist.reload

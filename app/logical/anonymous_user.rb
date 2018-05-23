@@ -8,6 +8,10 @@ class AnonymousUser
     0
   end
 
+  def level_string
+    "Anonymous"
+  end
+
   def comment_threshold
     0
   end
@@ -36,10 +40,6 @@ class AnonymousUser
     true
   end
 
-  def is_banned?
-    false
-  end
-
   def is_banned_or_ip_banned?
     false
   end
@@ -61,15 +61,11 @@ class AnonymousUser
   end
 
   def always_resize_images?
-    false
+    true
   end
 
   def show_samples?
     true
-  end
-
-  def tag_subscriptions
-    []
   end
 
   def favorite_tags
@@ -113,6 +109,14 @@ class AnonymousUser
   end
 
   def can_remove_from_pools?
+    false
+  end
+
+  def can_view_flagger?(flagger_id)
+    false
+  end
+
+  def can_view_flagger_on_post?(flag)
     false
   end
 
@@ -177,6 +181,10 @@ class AnonymousUser
     false
   end
 
+  def hide_favorites?
+    false
+  end
+
   def enable_sequential_post_navigation
     true
   end
@@ -214,7 +222,7 @@ class AnonymousUser
   end
 
   def custom_style
-    nil
+    ""
   end
 
   def show_deleted_children?
@@ -222,7 +230,7 @@ class AnonymousUser
   end
 
   def saved_searches
-    []
+    SavedSearch.where(false)
   end
 
   def has_saved_searches?
@@ -245,19 +253,35 @@ class AnonymousUser
     false
   end
 
-  def is_voter?
-    false
-  end
-
-  def is_super_voter?
-    false
-  end
-
   def disable_tagged_filenames?
     false
   end
 
-  %w(member banned gold builder platinum janitor moderator admin).each do |name|
+  def ban_expired?
+    false
+  end
+
+  def disable_cropped_thumbnails?
+    false
+  end
+
+  def disable_mobile_gestures?
+    false
+  end
+
+  def enable_safe_mode?
+    false
+  end
+
+  def disable_responsive_mode?
+    false
+  end
+
+  def disable_post_tooltips?
+    false
+  end
+
+  User::Roles.reject {|r| r == :anonymous}.each do |name|
     define_method("is_#{name}?") do
       false
     end

@@ -1,17 +1,14 @@
 class PostsController < ApplicationController
-  before_filter :member_only, :except => [:show, :show_seq, :index, :home, :random]
-  before_filter :builder_only, :only => [:copy_notes]
-  before_filter :enable_cors, :only => [:index, :show]
+  before_action :member_only, :except => [:show, :show_seq, :index, :home, :random]
+  before_action :builder_only, :only => [:copy_notes]
   respond_to :html, :xml, :json
-  rescue_from PostSets::SearchError, :with => :rescue_exception
-  rescue_from Post::SearchError, :with => :rescue_exception
-  rescue_from ActiveRecord::StatementInvalid, :with => :rescue_exception
-  rescue_from ActiveRecord::RecordNotFound, :with => :rescue_exception
 
   def index
     if params[:md5].present?
       @post = Post.find_by_md5(params[:md5])
-      redirect_to post_path(@post)
+      respond_with(@post) do |format|
+        format.html { redirect_to(@post) }
+      end
     else
       limit = params[:limit] || (params[:tags] =~ /(?:^|\s)limit:(\d+)(?:$|\s)/ && $1) || CurrentUser.user.per_page
       @random = params[:random] || params[:tags] =~ /(?:^|\s)order:random(?:$|\s)/
@@ -34,7 +31,10 @@ class PostsController < ApplicationController
     include_deleted = @post.is_deleted? || (@post.parent_id.present? && @post.parent.is_deleted?) || CurrentUser.user.show_deleted_children?
     @parent_post_set = PostSets::PostRelationship.new(@post.parent_id, :include_deleted => include_deleted)
     @children_post_set = PostSets::PostRelationship.new(@post.id, :include_deleted => include_deleted)
-    respond_with(@post)
+
+    respond_with(@post) do |format|
+      format.html.tooltip { render layout: false }
+    end
   end
 
   def show_seq
@@ -49,10 +49,7 @@ class PostsController < ApplicationController
   def update
     @post = Post.find(params[:id])
 
-    if @post.visible?
-      @post.update_attributes(params[:post], :as => CurrentUser.role)
-    end
-
+    @post.update(post_params) if @post.visible?
     save_recent_tags
     respond_with_post_after_update(@post)
   end
@@ -84,7 +81,6 @@ class PostsController < ApplicationController
   end
 
   def random
-    count = Post.fast_count(params[:tags], :statement_timeout => CurrentUser.user.statement_timeout)
     @post = Post.tag_match(params[:tags]).random
     raise ActiveRecord::RecordNotFound if @post.nil?
     respond_with(@post) do |format|
@@ -116,6 +112,10 @@ private
   def respond_with_post_after_update(post)
     respond_with(post) do |format|
       format.html do
+        if post.warnings.any?
+          flash[:notice] = post.warnings.full_messages.join(".\n \n")
+        end
+
         if post.errors.any?
           @error_message = post.errors.full_messages.join("; ")
           render :template => "static/error", :status => 500
@@ -130,5 +130,19 @@ private
         render :json => post.to_json
       end
     end
+  end
+
+  def post_params
+    permitted_params = %i[
+      tag_string old_tag_string
+      parent_id old_parent_id
+      source old_source
+      rating old_rating
+      has_embedded_notes
+    ]
+    permitted_params += %i[is_rating_locked is_note_locked] if CurrentUser.is_builder?
+    permitted_params += %i[is_status_locked] if CurrentUser.is_admin?
+
+    params.require(:post).permit(permitted_params)
   end
 end

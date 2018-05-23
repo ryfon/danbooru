@@ -1,21 +1,18 @@
 # encoding: utf-8
 
 require 'test_helper'
-require 'helpers/pool_archive_test_helper'
 
 class PoolTest < ActiveSupport::TestCase
-  include PoolArchiveTestHelper
-
   setup do
     Timecop.travel(1.month.ago) do
-      @user = FactoryGirl.create(:user)
+      @user = FactoryBot.create(:user)
       CurrentUser.user = @user
     end
 
     CurrentUser.ip_addr = "127.0.0.1"
-    MEMCACHE.flush_all
 
     mock_pool_archive_service!
+    PoolArchive.sqs_service.stubs(:merge?).returns(false)
     start_pool_archive_transaction
   end
 
@@ -27,7 +24,7 @@ class PoolTest < ActiveSupport::TestCase
 
   context "A name" do
     setup do
-      @pool = FactoryGirl.create(:pool, :name => "xxx")
+      @pool = FactoryBot.create(:pool, :name => "xxx")
     end
 
     should "be mapped to a pool id" do
@@ -37,7 +34,7 @@ class PoolTest < ActiveSupport::TestCase
 
   context "A multibyte character name" do
     setup do
-      @mb_pool = FactoryGirl.create(:pool, :name => "àáâãäå")
+      @mb_pool = FactoryBot.create(:pool, :name => "àáâãäå")
     end
 
     should "be mapped to a pool id" do
@@ -47,15 +44,22 @@ class PoolTest < ActiveSupport::TestCase
 
   context "An id number" do
     setup do
-      @pool = FactoryGirl.create(:pool)
+      @pool = FactoryBot.create(:pool)
     end
 
     should "be mapped to a pool id" do
       assert_equal(@pool.id, Pool.name_to_id(@pool.id.to_s))
     end
+  end
 
-    should "be mapped to its name" do
-      assert_equal(@pool.name, Pool.id_to_name(@pool.id))
+  context "Creating a pool" do
+    setup do
+      @posts = FactoryBot.create_list(:post, 5)
+      @pool = FactoryBot.create(:pool, post_ids: @posts.map(&:id).join(" "))
+    end
+
+    should "initialize the post count" do
+      assert_equal(@posts.size, @pool.post_count)
     end
   end
 
@@ -63,25 +67,30 @@ class PoolTest < ActiveSupport::TestCase
     setup do
       PoolArchive.stubs(:enabled?).returns(true)
 
-      @pool = FactoryGirl.create(:pool)
-      @p1 = FactoryGirl.create(:post)
-      @p2 = FactoryGirl.create(:post)
-      @p3 = FactoryGirl.create(:post)
+      @pool = FactoryBot.create(:pool)
+      @p1 = FactoryBot.create(:post)
+      @p2 = FactoryBot.create(:post)
+      @p3 = FactoryBot.create(:post)
       CurrentUser.scoped(@user, "1.2.3.4") do
         @pool.add!(@p1)
+        @pool.reload
       end
       CurrentUser.scoped(@user, "1.2.3.5") do
         @pool.add!(@p2)
+        @pool.reload
       end
       CurrentUser.scoped(@user, "1.2.3.6") do
         @pool.add!(@p3)
+        @pool.reload
       end
       CurrentUser.scoped(@user, "1.2.3.7") do
         @pool.remove!(@p1)
+        @pool.reload
       end
       CurrentUser.scoped(@user, "1.2.3.8") do
         version = @pool.versions[1]
         @pool.revert_to!(version)
+        @pool.reload
       end
     end
 
@@ -111,14 +120,26 @@ class PoolTest < ActiveSupport::TestCase
 
   context "Updating a pool" do
     setup do
-      @pool = FactoryGirl.create(:pool)
-      @p1 = FactoryGirl.create(:post)
-      @p2 = FactoryGirl.create(:post)
+      @pool = FactoryBot.create(:pool)
+      @p1 = FactoryBot.create(:post)
+      @p2 = FactoryBot.create(:post)
     end
 
     context "by adding a new post" do
       setup do
         @pool.add!(@p1)
+      end
+
+      context "by #attributes=" do
+        setup do
+          @pool.attributes = {post_ids: [@p1, @p2].map(&:id).join(" ")}
+          @pool.synchronize
+          @pool.save
+        end
+
+        should "initialize the post count" do
+          assert_equal(2, @pool.post_count)
+        end
       end
 
       should "add the post to the pool" do
@@ -153,6 +174,9 @@ class PoolTest < ActiveSupport::TestCase
 
       context "to a deleted pool" do
         setup do
+          # must be a builder to update deleted pools.
+          CurrentUser.user = FactoryBot.create(:builder_user)
+
           @pool.update_attribute(:is_deleted, true)
           @pool.post_ids = "#{@pool.post_ids} #{@p2.id}"
           @pool.synchronize!
@@ -219,7 +243,7 @@ class PoolTest < ActiveSupport::TestCase
 
     should "create new versions for each distinct user" do
       assert_equal(1, @pool.versions.size)
-      user2 = Timecop.travel(1.month.ago) {FactoryGirl.create(:user)}
+      user2 = Timecop.travel(1.month.ago) {FactoryBot.create(:user)}
 
       CurrentUser.scoped(user2, "127.0.0.2") do
         @pool.post_ids = "#{@p1.id}"
@@ -229,12 +253,20 @@ class PoolTest < ActiveSupport::TestCase
       @pool.reload
       assert_equal(2, @pool.versions.size)
 
-      CurrentUser.scoped(user2, "127.0.0.2") do
+      CurrentUser.scoped(user2, "127.0.0.3") do
         @pool.post_ids = "#{@p1.id} #{@p2.id}"
         @pool.save
       end
 
       @pool.reload
+      assert_equal(3, @pool.versions.size)
+    end
+
+    should "should create a version if the name changes" do
+      assert_difference("@pool.versions.size", 1) do
+        @pool.update(name: "blah")
+        assert_equal("blah", @pool.versions.last.name)
+      end
       assert_equal(2, @pool.versions.size)
     end
 
@@ -245,7 +277,10 @@ class PoolTest < ActiveSupport::TestCase
     end
 
     should "normalize its name" do
-      @pool.update_attributes(:name => "A B")
+      @pool.update(:name => "  A  B  ")
+      assert_equal("A_B", @pool.name)
+
+      @pool.update(:name => "__A__B__")
       assert_equal("A_B", @pool.name)
     end
 
@@ -253,14 +288,23 @@ class PoolTest < ActiveSupport::TestCase
       @pool.update_attributes(:post_ids => " 1  2 ")
       assert_equal("1 2", @pool.post_ids)
     end
+
+    context "when validating names" do
+      should "not be valid for bad names" do
+        ["foo,bar", "foo*bar", "123", "___", "   ", "any", "none", "series", "collection"].each do |bad_name|
+          pool = Pool.create(name: bad_name)
+          assert pool.invalid?
+        end
+      end
+    end
   end
 
   context "An existing pool" do
     setup do
-      @pool = FactoryGirl.create(:pool)
-      @p1 = FactoryGirl.create(:post)
-      @p2 = FactoryGirl.create(:post)
-      @p3 = FactoryGirl.create(:post)
+      @pool = FactoryBot.create(:pool)
+      @p1 = FactoryBot.create(:post)
+      @p2 = FactoryBot.create(:post)
+      @p3 = FactoryBot.create(:post)
       @pool.add!(@p1)
       @pool.add!(@p2)
       @pool.add!(@p3)
@@ -307,18 +351,6 @@ class PoolTest < ActiveSupport::TestCase
     should "find the neighbors for the last post" do
       assert_equal(@p2.id, @p3_neighbors.previous)
       assert_nil(@p3_neighbors.next)
-    end
-  end
-
-  context "An anonymous pool" do
-    setup do
-      user = Timecop.travel(1.month.ago) {FactoryGirl.create(:user)}
-      CurrentUser.user = user
-    end
-
-    should "have a name starting with anon" do
-      pool = Pool.create_anonymous
-      assert_match(/^anon:\d+$/, pool.name)
     end
   end
 end

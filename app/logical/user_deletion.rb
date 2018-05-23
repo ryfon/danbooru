@@ -7,7 +7,7 @@ class UserDeletion
     user = User.find(user_id)
     Post.without_timeout do
       Post.raw_tag_match("fav:#{user_id}").where("true /* UserDeletion.remove_favorites_for */").find_each do |post|
-        Favorite.remove(post, user)
+        Favorite.remove(post: post, user: user)
       end
     end
   end
@@ -21,7 +21,7 @@ class UserDeletion
     validate
     clear_user_settings
     remove_favorites
-    clear_tag_subscriptions
+    clear_saved_searches
     rename
     reset_password
     create_mod_action
@@ -30,11 +30,11 @@ class UserDeletion
 private
   
   def create_mod_action
-    ModAction.log("user ##{user.id} deleted")
+    ModAction.log("user ##{user.id} deleted",:user_delete)
   end
 
-  def clear_tag_subscriptions
-    TagSubscription.where(:creator_id => user.id).destroy_all
+  def clear_saved_searches
+    SavedSearch.where(user_id: user.id).destroy_all
   end
 
   def clear_user_settings

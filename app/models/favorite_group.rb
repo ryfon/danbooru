@@ -1,17 +1,15 @@
 require 'ostruct'
 
-class FavoriteGroup < ActiveRecord::Base
+class FavoriteGroup < ApplicationRecord
   validates_uniqueness_of :name, :case_sensitive => false, :scope => :creator_id
   validates_format_of :name, :with => /\A[^,]+\Z/, :message => "cannot have commas"
-  belongs_to :creator, :class_name => "User"
+  belongs_to_creator
   before_validation :normalize_post_ids
   before_validation :normalize_name
-  before_validation :initialize_creator, :on => :create
   before_validation :strip_name
   validate :creator_can_create_favorite_groups, :on => :create
   validate :validate_number_of_posts
   before_save :update_post_count
-  attr_accessible :name, :post_ids, :post_id_array, :as => [:member, :gold, :platinum, :builder, :janitor, :moderator, :admin, :default]
 
   module SearchMethods
     def for_creator(user_id)
@@ -33,27 +31,33 @@ class FavoriteGroup < ActiveRecord::Base
       where("name ilike ? escape E'\\\\'", name.to_escaped_for_sql_like)
     end
 
+    def hide_private(user,params)
+      if user.hide_favorites?
+        where("is_public = true")
+      elsif params[:is_public].present?
+        where("is_public = ?", params[:is_public])
+      else
+        all
+      end
+    end
+
+    def default_order
+      order(name: :asc)
+    end
+
     def search(params)
-      q = where("true")
-      params = {} if params.blank?
+      q = super
 
       if params[:creator_id].present?
         user = User.find(params[:creator_id])
-        
-        if user.hide_favorites?
-          raise User::PrivilegeError.new
-        end
-
+        q = q.hide_private(user,params)
         q = q.where("creator_id = ?", user.id)
       elsif params[:creator_name].present?
         user = User.find_by_name(params[:creator_name])
-
-        if user.hide_favorites?
-          raise User::PrivilegeError.new
-        end
-
+        q = q.hide_private(user,params)
         q = q.where("creator_id = ?", user.id)
       else
+        q = q.hide_private(CurrentUser.user,params)
         q = q.where("creator_id = ?", CurrentUser.user.id)
       end
 
@@ -61,7 +65,9 @@ class FavoriteGroup < ActiveRecord::Base
         q = q.name_matches(params[:name_matches])
       end
 
-      q
+      q = q.attribute_matches(:is_public, params[:is_public])
+
+      q.apply_default_order(params)
     end
   end
 
@@ -119,10 +125,6 @@ class FavoriteGroup < ActiveRecord::Base
     end
   end
 
-  def initialize_creator
-    self.creator_id ||= CurrentUser.id
-  end
-
   def strip_name
     self.name = name.to_s.strip
   end
@@ -172,18 +174,31 @@ class FavoriteGroup < ActiveRecord::Base
     self.post_count = post_id_array.size
   end
 
-  def add!(post)
-    return if contains?(post.id)
+  def add!(post_id)
+    with_lock do
+      post_id = post_id.id if post_id.is_a?(Post)
+      return if contains?(post_id)
 
-    clear_post_id_array
-    update_attributes(:post_ids => add_number_to_string(post.id, post_ids))
+      clear_post_id_array
+      update_attributes(:post_ids => add_number_to_string(post_id, post_ids))
+    end
   end
 
-  def remove!(post)
-    return unless contains?(post.id)
+  def self.purge_post(post_id)
+    post_id = post_id.id if post_id.is_a?(Post)
+    for_post(post_id).find_each do |group|
+      group.remove!(post_id)
+    end
+  end
 
-    clear_post_id_array
-    update_attributes(:post_ids => remove_number_from_string(post.id, post_ids))
+  def remove!(post_id)
+    with_lock do
+      post_id = post_id.id if post_id.is_a?(Post)
+      return unless contains?(post_id)
+
+      clear_post_id_array
+      update_attributes(:post_ids => remove_number_from_string(post_id, post_ids))
+    end
   end
 
   def add_number_to_string(number, string)
@@ -221,15 +236,15 @@ class FavoriteGroup < ActiveRecord::Base
     (post_count / CurrentUser.user.per_page.to_f).ceil
   end
 
-  def strip_name
-    self.name = name.to_s.strip
-  end
-
   def contains?(post_id)
     post_ids =~ /(?:\A| )#{post_id}(?:\Z| )/
   end
 
   def editable_by?(user)
     creator_id == user.id
+  end
+
+  def viewable_by?(user)
+    creator_id == user.id || !creator.hide_favorites? || is_public
   end
 end

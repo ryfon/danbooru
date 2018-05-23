@@ -10,7 +10,7 @@ module Sources
   module Strategies
     class Base
       attr_reader :url, :referer_url
-      attr_reader :artist_name, :profile_url, :image_url, :tags, :page_count
+      attr_reader :artist_name, :profile_url, :image_url, :tags
       attr_reader :artist_commentary_title, :artist_commentary_desc
 
       def self.url_match?(url)
@@ -20,7 +20,6 @@ module Sources
       def initialize(url, referer_url = nil)
         @url = url
         @referer_url = referer_url
-        @page_count = 1
       end
 
       # No remote calls are made until this method is called.
@@ -53,11 +52,6 @@ module Sources
         false
       end
 
-      # Determines whether or not to automatically create an ArtistCommentary
-      def has_artist_commentary?
-        false
-      end
-
       def normalize_for_artist_finder!
         url
       end
@@ -70,12 +64,8 @@ module Sources
         artist_name
       end
 
-      def artist_record
-        if artist_name.present?
-          Artist.other_names_match(artist_name)
-        else
-          nil
-        end
+      def artists
+        Artist.find_artists(url, referer_url)
       end
 
       def image_urls
@@ -86,14 +76,52 @@ module Sources
         (@tags || []).uniq
       end
 
+      def translated_tags
+        translated_tags = tags.map(&:first).flat_map(&method(:translate_tag)).uniq.sort
+        translated_tags.map { |tag| [tag.name, tag.category] }
+      end
+
+      # Given a tag from the source site, should return an array of corresponding Danbooru tags.
+      def translate_tag(untranslated_tag)
+        return [] if untranslated_tag.blank?
+
+        translated_tag_names = WikiPage.active.other_names_equal(untranslated_tag).uniq.pluck(:title)
+        translated_tag_names = TagAlias.to_aliased(translated_tag_names)
+        translated_tags = Tag.where(name: translated_tag_names)
+
+        if translated_tags.empty?
+          normalized_name = TagAlias.to_aliased([Tag.normalize_name(untranslated_tag)])
+          translated_tags = Tag.nonempty.where(name: normalized_name)
+        end
+
+        translated_tags
+      end
+
       # Should be set to a url for sites that prevent hotlinking, or left nil for sites that don't.
       def fake_referer
         nil
       end
 
+      def dtext_artist_commentary_title
+        self.class.to_dtext(artist_commentary_title)
+      end
+
+      def dtext_artist_commentary_desc
+        self.class.to_dtext(artist_commentary_desc)
+      end
+
     protected
       def agent
         raise NotImplementedError
+      end
+
+      # Convert commentary to dtext by stripping html tags. Sites can override
+      # this to customize how their markup is translated to dtext.
+      def self.to_dtext(text)
+        text = text.to_s
+        text = Rails::Html::FullSanitizer.new.sanitize(text, encode_special_chars: false)
+        text = CGI::unescapeHTML(text)
+        text
       end
     end
   end

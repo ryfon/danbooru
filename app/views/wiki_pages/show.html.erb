@@ -22,7 +22,7 @@
             <p><%= wiki_page_other_names_list(@wiki_page) %></p>
           <% end %>
 
-          <%= format_text(@wiki_page.body, :ragel => true) %>
+          <%= format_text(@wiki_page.body) %>
 
           <% if @wiki_page.artist %>
             <p><%= link_to "View artist", @wiki_page.artist %></p>
@@ -34,7 +34,7 @@
         <% end %>
       </div>
 
-        <%#= wiki_page_post_previews(@wiki_page) %>
+        <%= wiki_page_post_previews(@wiki_page) %>
     </section>
   </div>
 </div>
@@ -44,7 +44,7 @@
 <% end %>
 
 <% content_for(:html_header) do %>
-  <meta name="description" content="<%= @wiki_page.presenter.blurb %>"></meta>
+  <meta name="description" content="<%= strip_dtext(@wiki_page.presenter.excerpt) %>"></meta>
 <% end %>
 
 <%= render "secondary_links" %>

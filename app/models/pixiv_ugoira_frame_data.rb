@@ -1,4 +1,3 @@
-class PixivUgoiraFrameData < ActiveRecord::Base
-  attr_accessible :post_id, :data, :content_type
+class PixivUgoiraFrameData < ApplicationRecord
   serialize :data
 end

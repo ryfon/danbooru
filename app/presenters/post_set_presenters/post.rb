@@ -1,28 +1,27 @@
 module PostSetPresenters
   class Post < Base
-    attr_accessor :post_set, :tag_set_presenter
+    attr_accessor :post_set
     delegate :posts, :to => :post_set
 
     def initialize(post_set)
       @post_set = post_set
-      @tag_set_presenter = TagSetPresenter.new(related_tags)
+    end
+
+    def tag_set_presenter
+      @tag_set_presenter ||= TagSetPresenter.new(related_tags)
     end
 
     def related_tags
       if post_set.is_pattern_search?
         pattern_tags
       elsif post_set.is_saved_search?
-        SavedSearch.categories_for(CurrentUser.user).map {|x| "search:#{x}"}
-      elsif post_set.is_tag_subscription?
-        post_set.tag_subscription_tags
+        SavedSearch.labels_for(CurrentUser.user.id).map {|x| "search:#{x}"}
       elsif post_set.is_single_tag?
         related_tags_for_single(post_set.tag_string)
       elsif post_set.unordered_tag_array.size == 1
         related_tags_for_single(post_set.unordered_tag_array.first)
       elsif post_set.tag_string =~ /(?:^|\s)(?:#{Tag::SUBQUERY_METATAGS}):\S+/
         calculate_related_tags_from_post_set
-      elsif post_set.tag_string =~ /search:/
-        saved_search_tags
       elsif post_set.is_empty_tag?
         popular_tags
       else
@@ -31,7 +30,11 @@ module PostSetPresenters
     end
 
     def popular_tags
-      Tag.trending
+      if PopularSearchService.enabled?
+        PopularSearchService.new(Date.today).tags.slice(0, 25)
+      else
+        Tag.trending
+      end
     end
 
     def pattern_tags
@@ -53,11 +56,11 @@ module PostSetPresenters
     end
 
     def calculate_related_tags_from_post_set
-      RelatedTagCalculator.calculate_from_post_set_to_array(post_set).map(&:first)
+      RelatedTagCalculator.calculate_from_posts_to_array(post_set.posts).map(&:first)
     end
 
-    def saved_search_tags
-      SavedSearch.categories_for(CurrentUser.user).map {|x| "search:#{x}"}
+    def saved_search_labels
+      SavedSearch.labels_for(CurrentUser.user.id).map {|x| "search:#{x}"}
     end
 
     def tag_list_html(template, options = {})

@@ -1,6 +1,8 @@
-FactoryGirl.define do
+FactoryBot.define do
   factory(:user, aliases: [:creator, :updater]) do
-    name {(rand(1_000_000) + 10).to_s}
+    sequence :name do |n|
+      "user#{n}"
+    end
     password "password"
     password_hash {User.sha1("password")}
     email {FFaker::Internet.email}
@@ -13,8 +15,8 @@ FactoryGirl.define do
     bit_prefs 0
 
     factory(:banned_user) do
+      transient { ban_duration 3 }
       is_banned true
-      after(:create) { |user| create(:ban, user: user) }
     end
 
     factory(:member_user) do
@@ -41,12 +43,6 @@ FactoryGirl.define do
     factory(:contrib_user) do
       level 32
       bit_prefs User.flag_value_for("can_upload_free")
-    end
-
-
-    factory(:janitor_user) do
-      level 35
-      can_approve_posts true
     end
 
     factory(:moderator_user) do

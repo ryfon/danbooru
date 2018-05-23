@@ -3,14 +3,12 @@ require 'test_helper'
 class TagAliasRequestTest < ActiveSupport::TestCase
   context "A tag alias request" do
     setup do
-      @user = FactoryGirl.create(:user)
+      @user = FactoryBot.create(:user)
       CurrentUser.user = @user
       CurrentUser.ip_addr = "127.0.0.1"
-      MEMCACHE.flush_all
     end
 
     teardown do
-      MEMCACHE.flush_all
       CurrentUser.user = nil
       CurrentUser.ip_addr = nil
     end
@@ -47,6 +45,12 @@ class TagAliasRequestTest < ActiveSupport::TestCase
         tar = TagAliasRequest.new(:antecedent_name => "aaa", :consequent_name => "bbb", :reason => "reason", :skip_secondary_validations => true)
         tar.create
       end
+    end
+
+    should "save the forum post id" do
+      tar = TagAliasRequest.new(:antecedent_name => "aaa", :consequent_name => "bbb", :reason => "reason", :skip_secondary_validations => true)
+      tar.create
+      assert_equal(tar.forum_topic.posts.first.id, tar.tag_alias.forum_post.id)
     end
   end
 end

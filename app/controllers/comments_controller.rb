@@ -1,13 +1,12 @@
 class CommentsController < ApplicationController
   respond_to :html, :xml, :json
-  before_filter :member_only, :except => [:index, :search, :show]
-  rescue_from ActiveRecord::StatementInvalid, :with => :rescue_exception
-  skip_before_filter :api_check
+  before_action :member_only, :except => [:index, :search, :show]
+  skip_before_action :api_check
 
   def index
-    if params[:group_by] == "comment"
+    if params[:group_by] == "comment" || request.format == Mime::Type.lookup("application/atom+xml")
       index_by_comment
-    elsif request.format == Mime::JS
+    elsif request.format == Mime::Type.lookup("text/javascript")
       index_for_post
     else
       index_by_post
@@ -24,19 +23,16 @@ class CommentsController < ApplicationController
   def update
     @comment = Comment.find(params[:id])
     check_privilege(@comment)
-    @comment.update(update_params, :as => CurrentUser.role)
+    @comment.update(comment_params(:update))
     respond_with(@comment, :location => post_path(@comment.post_id))
   end
 
   def create
-    @comment = Comment.create(create_params, :as => CurrentUser.role)
+    @comment = Comment.create(comment_params(:create))
+    flash[:notice] = @comment.valid? ? "Comment posted" : @comment.errors.full_messages.join("; ")
     respond_with(@comment) do |format|
       format.html do
-        if @comment.errors.any?
-          redirect_to post_path(@comment.post), :notice => @comment.errors.full_messages.join("; ")
-        else
-          redirect_to post_path(@comment.post), :notice => "Comment posted"
-        end
+        redirect_back fallback_location: (@comment.post || comments_path)
       end
     end
   end
@@ -49,7 +45,7 @@ class CommentsController < ApplicationController
 
   def show
     @comment = Comment.find(params[:id])
-    respond_with(@comment)
+    respond_with(@comment, methods: [:quoted_response])
   end
 
   def destroy
@@ -79,10 +75,9 @@ private
   end
 
   def index_by_post
-    @posts = Post.where("last_comment_bumped_at IS NOT NULL").tag_match(params[:tags]).reorder("last_comment_bumped_at DESC").paginate(params[:page], :limit => 5, :search_count => params[:search])
+    @posts = Post.where("last_comment_bumped_at IS NOT NULL").tag_match(params[:tags]).reorder("last_comment_bumped_at DESC NULLS LAST").paginate(params[:page], :limit => 5, :search_count => params[:search])
     @posts.each # hack to force rails to eager load
     respond_with(@posts) do |format|
-      format.html {render :action => "index_by_post"}
       format.xml do
         render :xml => @posts.to_xml(:root => "posts")
       end
@@ -90,9 +85,11 @@ private
   end
 
   def index_by_comment
-    @comments = Comment.search(params[:search]).paginate(params[:page], :limit => params[:limit], :search_count => params[:search])
+    @comments = Comment.search(search_params).paginate(params[:page], :limit => params[:limit], :search_count => params[:search])
     respond_with(@comments) do |format|
-      format.html {render :action => "index_by_comment"}
+      format.atom do
+        @comments = @comments.includes(:post, :creator).load
+      end
       format.xml do
         render :xml => @comments.to_xml(:root => "comments")
       end
@@ -105,11 +102,12 @@ private
     end
   end
 
-  def create_params
-    params.require(:comment).permit(:post_id, :body, :do_not_bump_post, :is_sticky)
-  end
+  def comment_params(context)
+    permitted_params = %i[body post_id]
+    permitted_params += %i[do_not_bump_post] if context == :create
+    permitted_params += %i[is_deleted] if context == :update
+    permitted_params += %i[is_sticky] if CurrentUser.is_moderator?
 
-  def update_params
-    params.require(:comment).permit(:body, :is_deleted, :is_sticky)
+    params.require(:comment).permit(permitted_params)
   end
 end

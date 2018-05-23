@@ -4,15 +4,14 @@
   Danbooru.Post.pending_update_count = 0;
 
   Danbooru.Post.initialize_all = function() {
-    this.initialize_post_previews();
-
     if ($("#c-posts").length) {
       this.initialize_shortcuts();
+      this.initialize_saved_searches();
     }
 
     if ($("#c-posts").length && $("#a-index").length) {
       this.initialize_excerpt();
-      this.initialize_saved_searches();
+      this.initialize_gestures();
     }
 
     if ($("#c-posts").length && $("#a-show").length) {
@@ -23,14 +22,48 @@
       this.initialize_post_image_resize_links();
       this.initialize_post_image_resize_to_window_link();
       this.initialize_similar();
+      this.initialize_replace_image_dialog();
+      this.initialize_gestures();
 
-      if (Danbooru.meta("always-resize-images") === "true") {
+      if ((Danbooru.meta("always-resize-images") === "true") || (Danbooru.meta("viewport") && (window.screen.width <= 660))) {
         $("#image-resize-to-window-link").click();
       }
     }
 
     if ($("#image").length) {
       this.initialize_edit_dialog();
+    }
+  }
+
+  Danbooru.Post.initialize_gestures = function() {
+    if (Danbooru.meta("disable-mobile-gestures") === "true") {
+      return;
+    }
+    var $body = $("body");
+    if ($body.data("hammer")) {
+      return;
+    }
+    if (!Danbooru.test_max_width(660)) {
+      return;
+    }
+    $("#image-container").css({overflow: "visible"});
+    var hasPrev = $("#a-show").length || $(".paginator a[rel~=prev]").length;
+    var hasNext = $("#a-index").length && $(".paginator a[rel~=next]").length;
+
+    $body.hammer({touchAction: 'pan-y', recognizers: [[Hammer.Swipe, { threshold: 20, velocity: 0.4, direction: Hammer.DIRECTION_HORIZONTAL }]], inputClass: Hammer.TouchInput});
+
+    if (hasPrev) {
+      $body.hammer().on("swiperight", function(e) {
+        $("body").css({"transition-timing-function": "ease", "transition-duration": "0.2s", "opacity": "0", "transform": "translateX(150%)"});
+        $.timeout(200).done(function() {Danbooru.Post.swipe_prev(e)});
+      });
+    }
+
+    if (hasNext) {
+      $body.hammer().on("swipeleft", function(e) {
+        $("body").css({"transition-timing-function": "ease", "transition-duration": "0.2s", "opacity": "0", "transform": "translateX(-150%)"});
+        $.timeout(200).done(function() {Danbooru.Post.swipe_next(e)});
+      });
     }
   }
 
@@ -42,16 +75,7 @@
     });
 
     $("#toggle-related-tags-link").click(function(e) {
-      var $related_tags = $("#related-tags");
-      if ($related_tags.is(":visible")) {
-        $related_tags.hide();
-        $(e.target).html("&raquo;");
-      } else {
-        $related_tags.show();
-        $("#related-tags-button").trigger("click");
-        $("#find-artist-button").trigger("click");
-        $(e.target).html("&laquo;");
-      }
+      Danbooru.RelatedTag.toggle();
       e.preventDefault();
     });
   }
@@ -67,7 +91,7 @@
     $("#form").appendTo(dialog);
     dialog.dialog({
       title: "Edit tags",
-      width: $(window).width() / 3,
+      width: $(window).width() * 0.6,
         position: {
           my: "right",
           at: "right-20",
@@ -107,7 +131,7 @@
     });
 
     dialog.parent().mouseout(function(e) {
-      dialog.parent().css({"opacity": 0.6});
+      dialog.parent().css({"opacity": 0.6, "transition": "opacity .2s ease"});
     })
     .mouseover(function(e) {
       dialog.parent().css({"opacity": 1});
@@ -115,17 +139,13 @@
 
     $tag_string.css({"resize": "none", "width": "100%"});
     $tag_string.focus().selectEnd().height($tag_string[0].scrollHeight);
-
-    var $image = $("#c-uploads .ui-wrapper #image, #c-uploads .ui-wrapper:has(#image)");
-    $image.height($image.resizable("option", "maxHeight"));
-    $image.width($image.resizable("option", "maxWidth"));
   }
 
   Danbooru.Post.close_edit_dialog = function(e, ui) {
     $("#form").appendTo($("#c-posts #edit,#c-uploads #a-new"));
     $("#edit-dialog").remove();
-    $("#related-tags").show();
-    $("#toggle-related-tags-link").html("&raquo;").hide();
+    Danbooru.RelatedTag.show();
+    $("#toggle-related-tags-link").hide();
     var $tag_string = $("#post_tag_string,#upload_tag_string");
     $("div.input").has($tag_string).prevAll().show();
     $("#open-edit-dialog").show();
@@ -139,14 +159,26 @@
     });
   }
 
+  Danbooru.Post.swipe_prev = function(e) {
+    if ($("#a-show").length) {
+      window.history.back();
+    } if ($(".paginator a[rel~=prev]").length) {
+      location.href = $("a[rel~=prev]").attr("href");
+    }
+
+    e.preventDefault();
+  }
+
   Danbooru.Post.nav_prev = function(e) {
     if ($("#search-seq-nav").length) {
       var href = $("#search-seq-nav a[rel~=prev]").attr("href");
       if (href) {
         location.href = href;
       }
+    } else if ($(".paginator a[rel~=prev]").length) {
+      location.href = $("a[rel~=prev]").attr("href");
     } else {
-      var href = $("#pool-nav a.active[rel=prev], #favgroup-nav a.active[rel=prev]").attr("href");
+      var href = $("#pool-nav a.active[rel~=prev], #favgroup-nav a.active[rel~=prev]").attr("href");
       if (href) {
         location.href = href;
       }
@@ -159,11 +191,21 @@
     if ($("#search-seq-nav").length) {
       var href = $("#search-seq-nav a[rel~=next]").attr("href");
       location.href = href;
+    } else if ($(".paginator a[rel~=next]").length) {
+      location.href = $(".paginator a[rel~=next]").attr("href");
     } else {
-      var href = $("#pool-nav a.active[rel=next], #favgroup-nav a.active[rel=next]").attr("href");
+      var href = $("#pool-nav a.active[rel~=next], #favgroup-nav a.active[rel~=next]").attr("href");
       if (href) {
         location.href = href;
       }
+    }
+
+    e.preventDefault();
+  }
+
+  Danbooru.Post.swipe_next = function(e) {
+    if ($(".paginator a[rel~=next ]").length) {
+      location.href = $(".paginator a[rel~=next]").attr("href");
     }
 
     e.preventDefault();
@@ -177,31 +219,20 @@
         e.preventDefault();
       });
 
+      if (Danbooru.meta("current-user-can-approve-posts") === "true") {
+        Danbooru.keydown("shift+o", "approve", function(e) {
+          $(".approve-link").click();
+        });
+      }
+
       Danbooru.keydown("a", "prev_page", Danbooru.Post.nav_prev);
       Danbooru.keydown("d", "next_page", Danbooru.Post.nav_next);
-
-      Danbooru.keydown("f", "favorite", function(e) {
-        if ($("#add-to-favorites").is(":visible")) {
-          $("#add-to-favorites").click();
-        } else {
-          if (Danbooru.meta("current-user-id") == "") {
-            Danbooru.notice("You must be logged in to favorite posts");
-          } else {
-            Danbooru.notice("You have already favorited this post");
-          }
-        }
-        e.preventDefault();
-      });
+      Danbooru.keydown("f", "favorite", Danbooru.Post.favorite);
+      Danbooru.keydown("shift+f", "unfavorite", Danbooru.Post.unfavorite);
     }
   }
 
   Danbooru.Post.initialize_links = function() {
-    $("#side-edit-link").click(function(e) {
-      $("#post-edit-link").trigger("click");
-      $("#post_tag_string").trigger("focus");
-      e.preventDefault();
-    });
-
     $("#copy-notes").click(function(e) {
       var current_post_id = $("meta[name=post-id]").attr("content");
       var other_post_id = parseInt(prompt("Enter the ID of the post to copy all notes to:"), 10);
@@ -288,43 +319,32 @@
     });
   }
 
-  Danbooru.Post.initialize_post_previews = function() {
-    $(".post-preview").each(function(i, v) {
-      Danbooru.Post.initialize_title_for(v);
-    });
-  }
-
-  Danbooru.Post.initialize_title_for = function(post) {
-    var $post = $(post);
-    var $img = $post.find("img");
-    var score = null;
-    if ($post.data("views")) {
-      score = " views:" + $post.data("views");
-    } else {
-      score = " score:" + $post.data("score");
+  Danbooru.Post.expand_image = function(e) {
+    if (Danbooru.test_max_width(660)) {
+      // just do the default behavior
+      return;
     }
-    $img.attr("title", $post.attr("data-tags") + " user:" + $post.attr("data-uploader") + " rating:" + $post.data("rating") + score);
+
+    var $link = $(e.target);
+    var $image = $("#image");
+    var $notice = $("#image-resize-notice");
+    $image.attr("src", $link.attr("href"));
+    $image.css("opacity", "0.25");
+    $image.width($image.data("original-width"));
+    $image.height($image.data("original-height"));        
+    $image.on("load", function() {
+      $image.css("opacity", "1");
+      $notice.hide();
+    });
+    $notice.children().eq(0).hide();
+    $notice.children().eq(1).show(); // Loading message
+    Danbooru.Note.Box.scale_all();
+    $image.data("scale-factor", 1);
+    e.preventDefault();
   }
 
   Danbooru.Post.initialize_post_image_resize_links = function() {
-    $("#image-resize-link").click(function(e) {
-      var $link = $(e.target);
-      var $image = $("#image");
-      var $notice = $("#image-resize-notice");
-      $image.attr("src", $link.attr("href"));
-      $image.css("opacity", "0.25");
-      $image.width($image.data("original-width"));
-      $image.height($image.data("original-height"));        
-      $image.on("load", function() {
-        $image.css("opacity", "1");
-        $notice.hide();
-      });
-      $notice.children().eq(0).hide();
-      $notice.children().eq(1).show(); // Loading message
-      Danbooru.Note.Box.scale_all();
-      $image.data("scale-factor", 1);
-      e.preventDefault();
-    });
+    $("#image-resize-link").click(Danbooru.Post.expand_image);
 
     if ($("#image-resize-notice").length) {
       Danbooru.keydown("v", "resize", function(e) {
@@ -336,7 +356,7 @@
           $image.attr("src", $("#image-container").data("large-file-url"));
           $image.css("opacity", "0.25");
           $image.width($image.data("large-width"));
-          $image.height($image.data("large-height")); 
+          $image.height($image.data("large-height"));
           $notice.children().eq(0).show();
           $notice.children().eq(1).hide(); // Loading message
           $image.on("load", function() {
@@ -351,33 +371,36 @@
     }
   }
 
-  Danbooru.Post.initialize_post_image_resize_to_window_link = function() {
-    $("#image-resize-to-window-link").click(function(e) {
-      var $img = $("#image");
-
-      if (($img.data("scale-factor") === 1) || ($img.data("scale-factor") === undefined)) {
-        if ($(window).width() > 660) {
-          var client_width = $(window).width() - $("#sidebar").width() - 75;
-        } else {
-          var client_width = $(window).width() - 30;
-        }
-        var client_height = $(window).height();
-
-        if ($img.width() > client_width) {
-          var ratio = client_width / $img.data("original-width");
-          $img.data("scale-factor", ratio);
-          $img.css("width", $img.data("original-width") * ratio);
-          $img.css("height", $img.data("original-height") * ratio);
-          Danbooru.Post.resize_ugoira_controls();
-        }
+  Danbooru.Post.resize_image_to_window = function($img) {
+    if (($img.data("scale-factor") === 1) || ($img.data("scale-factor") === undefined)) {
+      if ($(window).width() > 660) {
+        var sidebar_width = $("#sidebar").width() || 0;
+        var client_width = $(window).width() - sidebar_width - 75;
       } else {
-        $img.data("scale-factor", 1);
-        $img.width($img.data("original-width"));
-        $img.height($img.data("original-height"));
+        var client_width = $(window).width() - 2;
+      }
+      var client_height = $(window).height();
+
+      if ($img.width() > client_width) {
+        var ratio = client_width / $img.data("original-width");
+        $img.data("scale-factor", ratio);
+        $img.css("width", $img.data("original-width") * ratio);
+        $img.css("height", $img.data("original-height") * ratio);
         Danbooru.Post.resize_ugoira_controls();
       }
+    } else {
+      $img.data("scale-factor", 1);
+      $img.width($img.data("original-width"));
+      $img.height($img.data("original-height"));
+      Danbooru.Post.resize_ugoira_controls();
+    }
 
-      Danbooru.Note.Box.scale_all();
+    Danbooru.Note.Box.scale_all();
+  }
+
+  Danbooru.Post.initialize_post_image_resize_to_window_link = function() {
+    $("#image-resize-to-window-link").click(function(e) {
+      Danbooru.Post.resize_image_to_window($("#image"));
       e.preventDefault();
     });
   }
@@ -472,7 +495,6 @@
     if (data.has_visible_children) {
       $post.addClass("post-status-has-children");
     }
-    Danbooru.Post.initialize_title_for($post);
   }
 
   Danbooru.Post.vote = function(score, id) {
@@ -518,44 +540,54 @@
   }
 
   Danbooru.Post.approve = function(post_id) {
-    $.ajax({
-      type: "POST",
-      url: "/moderator/post/approval.json",
-      data: {"post_id": post_id},
-      dataType: "json",
-      success: function(data) {
-        if (!data.success) {
-          Danbooru.error("Error: " + data.reason);
-        } else {
-          var $post = $("#post_" + post_id);
-          if ($post.length) {
-            $post.data("flags", $post.data("flags").replace(/pending/, ""));
-            $post.removeClass("post-status-pending");
-          }
-          Danbooru.notice("Approved post #" + post_id);
-          $("#pending-approval-notice").hide();
-        }
+    $.post(
+      "/moderator/post/approval.json",
+      {"post_id": post_id}
+    ).fail(function(data) {
+      var message = $.map(data.responseJSON.errors, function(msg, attr) { return msg; }).join("; ");
+      Danbooru.error("Error: " + message);
+    }).done(function(data) {
+      var $post = $("#post_" + post_id);
+      if ($post.length) {
+        $post.data("flags", $post.data("flags").replace(/pending/, ""));
+        $post.removeClass("post-status-pending");
+        Danbooru.notice("Approved post #" + post_id);
       }
     });
   }
 
+  Danbooru.Post.favorite = function (e) {
+    if ($("#add-to-favorites").is(":visible")) {
+      $("#add-to-favorites")[0].click();
+    } else {
+      if (Danbooru.meta("current-user-id") == "") {
+        Danbooru.notice("You must be logged in to favorite posts");
+      } else {
+        Danbooru.notice("You have already favorited this post");
+      }
+    }
+  };
+
+  Danbooru.Post.unfavorite = function (e) {
+    $.ajax("/favorites/" + Danbooru.meta("post-id") + ".js", {
+      type: "DELETE"
+    });
+  };
+
   Danbooru.Post.initialize_saved_searches = function() {
-    $("#saved_search_category").autocomplete({
-      minLength: 1,
+    $("#new_saved_search #saved_search_label_string").autocomplete({
+      search: function() {
+        $(this).data("ui-autocomplete").menu.bindings = $();
+      },
       source: function(req, resp) {
-        $.ajax({
-          url: "/saved_searches/categories.json",
-          method: "get",
-          success: function(data) {
-            resp($.map(data, function(saved_search) {
-              var category = saved_search.category === null ? "uncategorized" : saved_search.category;
-              return {
-                label: category,
-                value: category
-              };
-            }));
-          }
-        })
+        Danbooru.SavedSearch.labels(req.term).then(function(labels) {
+          resp(labels.map(function(label) {
+            return {
+              label: label.replace(/_/g, " "),
+              value: label
+            };
+          }));
+        });
       }
     });
 
@@ -574,19 +606,61 @@
       }
     });
 
-    $("#save-search").click(function() {
-      if (Danbooru.meta("disable-categorized-saved-searches") === "false") {
+    $("#save-search").click(function(e) {
+      $("#save-search-dialog #saved_search_query").val($("#tags").val());
+
+      if (Danbooru.meta("disable-labeled-saved-searches") === "false") {
         $("#save-search-dialog").dialog("open");
       } else {
         $.post(
           "/saved_searches.js",
           {
-            "saved_search_tags": $("#tags").attr("value")
+            "saved_search": {
+              "query": $("#tags").val()
+            }
           }
         );
       }
+
+      e.preventDefault();
+    });
+
+    $("#search-dropdown #wiki-search").click(function(e) {
+      window.location.href = "/wiki_pages?search%5Btitle%5D=" + encodeURIComponent($("#tags").val());
+      e.preventDefault();
+    });
+
+    $("#search-dropdown #artist-search").click(function(e) {
+      window.location.href = "/artists?search%5Bname%5D=" + encodeURIComponent($("#tags").val());
+      e.preventDefault();
     });
   }
+
+  Danbooru.Post.initialize_replace_image_dialog = function() {
+    $("#replace-image-dialog").dialog({
+      autoOpen: false,
+      width: 700,
+      modal: true,
+      buttons: {
+        "Submit": function() {
+          $("#replace-image-dialog form").submit();
+          $(this).dialog("close");
+        },
+        "Cancel": function() {
+          $(this).dialog("close");
+        }
+      }
+    });
+
+    $('#replace-image-dialog form').submit(function() {
+      $('#replace-image-dialog').dialog('close');
+    });
+
+    $("#replace-image").click(function(e) {
+      e.preventDefault();
+      $("#replace-image-dialog").dialog("open");
+    });
+  };
 })();
 
 $(document).ready(function() {

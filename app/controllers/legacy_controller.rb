@@ -1,10 +1,21 @@
 class LegacyController < ApplicationController
-  before_filter :member_only, :only => [:create_post]
-  rescue_from PostSets::SearchError, :with => :rescue_exception
+  before_action :member_only, :only => [:create_post]
+  respond_to :json, :xml
 
   def posts
     @post_set = PostSets::Post.new(tag_query, params[:page], params[:limit], format: "json")
-    @posts = @post_set.posts
+    @posts = @post_set.posts.map(&:legacy_attributes)
+
+    respond_with(@posts) do |format|
+      format.xml do
+        xml = Builder::XmlMarkup.new(indent: 2)
+        xml.instruct!
+        xml.posts do
+          @posts.each { |attrs| xml.post(attrs) }
+        end
+        render xml: xml.target!
+      end
+    end
   end
 
   def create_post
@@ -29,11 +40,11 @@ class LegacyController < ApplicationController
   end
 
   def artists
-    @artists = Artist.limit(100).search(params[:search]).paginate(params[:page])
+    @artists = Artist.limit(100).search(search_params).paginate(params[:page])
   end
 
   def unavailable
-    render :text => "this resource is no longer available", :status => 410
+    render :plain => "this resource is no longer available", :status => 410
   end
 
 private

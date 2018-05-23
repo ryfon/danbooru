@@ -1,25 +1,28 @@
-class WikiPage < ActiveRecord::Base
+class WikiPage < ApplicationRecord
   class RevertError < Exception ; end
 
   before_save :normalize_title
   before_save :normalize_other_names
-  before_validation :initialize_creator, :on => :create
-  before_validation :initialize_updater
   after_save :create_version
-  belongs_to :creator, :class_name => "User"
-  belongs_to :updater, :class_name => "User"
+  belongs_to_creator
+  belongs_to_updater
   validates_uniqueness_of :title, :case_sensitive => false
   validates_presence_of :title
-  validate :validate_locker_is_builder
+  validates_presence_of :body, :unless => -> { is_deleted? || other_names.present? }
+  validate :validate_rename
   validate :validate_not_locked
-  attr_accessible :title, :body, :is_locked, :is_deleted, :other_names
+  attr_accessor :skip_secondary_validations
   has_one :tag, :foreign_key => "name", :primary_key => "title"
-  has_one :artist, lambda {where(:is_active => true)}, :foreign_key => "name", :primary_key => "title"
-  has_many :versions, lambda {order("wiki_page_versions.id ASC")}, :class_name => "WikiPageVersion", :dependent => :destroy
+  has_one :artist, -> {where(:is_active => true)}, :foreign_key => "name", :primary_key => "title"
+  has_many :versions, -> {order("wiki_page_versions.id ASC")}, :class_name => "WikiPageVersion", :dependent => :destroy
 
   module SearchMethods
     def titled(title)
       where("title = ?", title.mb_chars.downcase.tr(" ", "_"))
+    end
+
+    def title_in(titles)
+      where("title in (?)", titles.map{|x| x.mb_chars.downcase.tr(" ", "_")} )
     end
 
     def active
@@ -38,18 +41,29 @@ class WikiPage < ActiveRecord::Base
       end
     end
 
-    def other_names_match(names)
-      names = names.map{|name| name.to_escaped_for_tsquery}
-      query_sql = names.join(" | ")
+    def other_names_equal(name)
+      query_sql = name.unicode_normalize(:nfkc).to_escaped_for_tsquery
       where("other_names_index @@ to_tsquery('danbooru', E?)", query_sql)
     end
 
+    def other_names_match(name)
+      if name =~ /\*/
+        subquery = WikiPage.from("unnest(string_to_array(other_names, ' ')) AS other_name").where("other_name ILIKE ?", name.to_escaped_for_sql_like)
+        where(id: subquery)
+      else
+        other_names_equal(name)
+      end
+    end
+
+    def default_order
+      order(updated_at: :desc)
+    end
+
     def search(params = {})
-      q = where("true")
-      params = {} if params.blank?
+      q = super
 
       if params[:title].present?
-        q = q.where("title LIKE ? ESCAPE E'\\\\'", params[:title].mb_chars.downcase.tr(" ", "_").to_escaped_for_sql_like)
+        q = q.where("title LIKE ? ESCAPE E'\\\\'", params[:title].mb_chars.downcase.strip.tr(" ", "_").to_escaped_for_sql_like)
       end
 
       if params[:creator_id].present?
@@ -61,28 +75,34 @@ class WikiPage < ActiveRecord::Base
       end
 
       if params[:other_names_match].present?
-        q = q.other_names_match(params[:other_names_match].split(" "))
+        q = q.other_names_match(params[:other_names_match])
       end
 
       if params[:creator_name].present?
         q = q.where("creator_id = (select _.id from users _ where lower(_.name) = ?)", params[:creator_name].tr(" ", "_").mb_chars.downcase)
       end
 
-      if params[:hide_deleted] =~ /y/i
+      if params[:hide_deleted].to_s.truthy?
         q = q.where("is_deleted = false")
       end
 
-      if params[:other_names_present] == "yes"
+      if params[:other_names_present].to_s.truthy?
         q = q.where("other_names is not null and other_names != ''")
-      elsif params[:other_names_present] == "no"
+      elsif params[:other_names_present].to_s.falsy?
         q = q.where("other_names is null or other_names = ''")
       end
 
+      q = q.attribute_matches(:is_locked, params[:is_locked])
+      q = q.attribute_matches(:is_deleted, params[:is_deleted])
+
       params[:order] ||= params.delete(:sort)
-      if params[:order] == "time" || params[:order] == "Date"
-        q = q.order("updated_at desc")
-      elsif params[:order] == "title" || params[:order] == "Name"
+      case params[:order]
+      when "title"
         q = q.order("title")
+      when "post_count"
+        q = q.includes(:tag).order("tags.post_count desc nulls last").references(:tags)
+      else
+        q = q.apply_default_order(params)
       end
 
       q
@@ -106,17 +126,19 @@ class WikiPage < ActiveRecord::Base
     titled(title).select("title, id").first
   end
 
-  def validate_locker_is_builder
-    if is_locked_changed? && !CurrentUser.is_builder?
-      errors.add(:is_locked, "can be modified by builders only")
-      return false
-    end
-  end
-
   def validate_not_locked
     if is_locked? && !CurrentUser.is_builder?
       errors.add(:is_locked, "and cannot be updated")
       return false
+    end
+  end
+
+  def validate_rename
+    return if !will_save_change_to_title? || skip_secondary_validations
+
+    tag_was = Tag.find_by_name(Tag.normalize_name(title_was))
+    if tag_was.present? && tag_was.post_count > 0
+      errors.add(:title, "cannot be changed: '#{tag_was.name}' still has #{tag_was.post_count} posts. Move the posts and update any wikis linking to this page first.")
     end
   end
 
@@ -141,12 +163,12 @@ class WikiPage < ActiveRecord::Base
   end
 
   def normalize_other_names
-    normalized_other_names = other_names.to_s.gsub(/\u3000/, " ").scan(/\S+/)
+    normalized_other_names = other_names.to_s.unicode_normalize(:nfkc).scan(/[^[:space:]]+/)
     self.other_names = normalized_other_names.uniq.join(" ")
   end
 
-  def creator_name
-    User.id_to_name(creator_id).tr("_", " ")
+  def skip_secondary_validations=(value)
+    @skip_secondary_validations = value.to_s.truthy?
   end
 
   def category_name
@@ -157,12 +179,17 @@ class WikiPage < ActiveRecord::Base
     title.tr("_", " ")
   end
 
+  def wiki_page_changed?
+    saved_change_to_title? || saved_change_to_body? || saved_change_to_is_locked? || saved_change_to_is_deleted? || saved_change_to_other_names?
+  end
+
   def merge_version
     prev = versions.last
     prev.update_attributes(
       :title => title,
       :body => body,
       :is_locked => is_locked,
+      :is_deleted => is_deleted,
       :other_names => other_names
     )
   end
@@ -185,25 +212,13 @@ class WikiPage < ActiveRecord::Base
   end
 
   def create_version
-    if title_changed? || body_changed? || is_locked_changed? || is_deleted_changed? || other_names_changed?
+    if wiki_page_changed?
       if merge_version?
         merge_version
       else
         create_new_version
       end
     end
-  end
-  
-  def updater_name
-    User.id_to_name(updater_id)
-  end
-
-  def initialize_creator
-    self.creator_id = CurrentUser.user.id
-  end
-  
-  def initialize_updater
-    self.updater_id = CurrentUser.user.id
   end
 
   def post_set
@@ -221,7 +236,7 @@ class WikiPage < ActiveRecord::Base
       else
         match
       end
-    end.map {|x| x.mb_chars.downcase.tr(" ", "_").to_s}
+    end.map {|x| x.mb_chars.downcase.tr(" ", "_").to_s}.uniq
   end
 
   def visible?

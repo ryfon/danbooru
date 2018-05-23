@@ -28,7 +28,6 @@ class UserPromotion
 
     create_user_feedback unless options[:skip_feedback]
     create_dmail unless options[:skip_dmail]
-    update_saved_searches
     create_mod_actions
 
     user.save
@@ -38,11 +37,11 @@ private
   
   def create_mod_actions
     if old_can_approve_posts != user.can_approve_posts?
-      ModAction.log("\"#{promoter.name}\":/users/#{promoter.id} changed approval privileges for \"#{user.name}\":/users/#{user.id} from #{old_can_approve_posts} to [b]#{user.can_approve_posts?}[/b]")
+      ModAction.log("\"#{promoter.name}\":/users/#{promoter.id} changed approval privileges for \"#{user.name}\":/users/#{user.id} from #{old_can_approve_posts} to [b]#{user.can_approve_posts?}[/b]",:user_approval_privilege)
     end
 
     if old_can_upload_free != user.can_upload_free?
-      ModAction.log("\"#{promoter.name}\":/users/#{promoter.id} changed unlimited upload privileges for \"#{user.name}\":/users/#{user.id} from #{old_can_upload_free} to [b]#{user.can_upload_free?}[/b]")
+      ModAction.log("\"#{promoter.name}\":/users/#{promoter.id} changed unlimited upload privileges for \"#{user.name}\":/users/#{user.id} from #{old_can_upload_free} to [b]#{user.can_upload_free?}[/b]",:user_upload_privilege)
     end
   end
   
@@ -97,17 +96,5 @@ private
       :body => build_messages,
       :disable_dmail_notification => true
     )
-  end
-
-  def update_saved_searches
-    if user.is_gold?
-      user.saved_searches.each do |ss|
-        ss.update_listbooru_on_create
-      end
-    else
-      user.saved_searches.each do |ss|
-        ss.update_listbooru_on_destroy
-      end
-    end
   end
 end

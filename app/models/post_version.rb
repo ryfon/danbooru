@@ -1,8 +1,7 @@
-class PostVersion < ActiveRecord::Base
+class PostVersion < ApplicationRecord
   belongs_to :post
   belongs_to :updater, :class_name => "User"
   before_validation :initialize_updater
-  attr_accessible :post_id, :is_status_locked, :is_rating_locked, :is_note_locked, :source, :rating, :tag_string, :old_tag_string, :old_parent_id, :old_source, :old_rating, :last_noted_at, :parent_id, :tags
 
   module SearchMethods
     def for_user(user_id)
@@ -14,8 +13,7 @@ class PostVersion < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      params = {} if params.blank?
+      q = super
 
       if params[:updater_name].present?
         q = q.updater_name(params[:updater_name])
@@ -33,7 +31,7 @@ class PostVersion < ActiveRecord::Base
         q = q.where("id <= ?", params[:start_id].to_i)
       end
 
-      q
+      q.apply_default_order(params)
     end
   end
 
@@ -59,17 +57,6 @@ class PostVersion < ActiveRecord::Base
   def reload
     @tag_array = nil
     super
-  end
-
-  def sequence_for_post
-    versions = PostVersion.where(:post_id => post_id).order("updated_at desc, id desc")
-    diffs = []
-    versions.each_index do |i|
-      if i < versions.size - 1
-        diffs << versions[i].diff(versions[i + 1])
-      end
-    end
-    return diffs
   end
 
   def diff(version)

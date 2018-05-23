@@ -3,9 +3,15 @@ require 'test_helper'
 class UserNameChangeRequestTest < ActiveSupport::TestCase
   context "in all cases" do
     setup do
-      @admin = FactoryGirl.create(:admin_user)
-      @requester = FactoryGirl.create(:user)
+      @admin = FactoryBot.create(:admin_user)
+      @requester = FactoryBot.create(:user)
       CurrentUser.user = @requester
+      CurrentUser.ip_addr = "127.0.0.1"
+    end
+
+    teardown do
+      CurrentUser.user = nil
+      CurrentUser.ip_addr = nil
     end
     
     context "approving a request" do
@@ -20,7 +26,7 @@ class UserNameChangeRequestTest < ActiveSupport::TestCase
       end
       
       should "create a dmail" do
-        assert_difference("Dmail.count", 4) do
+        assert_difference("Dmail.count", 2) do
           @change_request.approve!
         end
       end
@@ -61,7 +67,7 @@ class UserNameChangeRequestTest < ActiveSupport::TestCase
       end
       
       should "create a dmail" do
-        assert_difference("Dmail.count", 2) do
+        assert_difference("Dmail.count", 1) do
           @change_request.reject!("msg")
         end
       end
@@ -84,6 +90,13 @@ class UserNameChangeRequestTest < ActiveSupport::TestCase
           )
           assert_equal(["Desired name already exists"], req.errors.full_messages)
         end
+      end
+
+      should "not convert the desired name to lower case" do
+        uncr = FactoryBot.create(:user_name_change_request, user: @requester, original_name: "provence.", desired_name: "Provence")
+        CurrentUser.scoped(@admin) { uncr.approve! }
+
+        assert_equal("Provence", @requester.name)
       end
     end
   end

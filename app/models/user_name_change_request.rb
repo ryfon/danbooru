@@ -1,14 +1,16 @@
-class UserNameChangeRequest < ActiveRecord::Base
+class UserNameChangeRequest < ApplicationRecord
+  after_initialize :initialize_attributes, if: :new_record?
   validates_presence_of :user_id, :original_name, :desired_name
   validates_inclusion_of :status, :in => %w(pending approved rejected)
   belongs_to :user
-  belongs_to :approver, :class_name => "User"
-  validate :uniqueness_of_desired_name
+  belongs_to :approver, :class_name => "User", optional: true
   validate :not_limited, :on => :create
-  validates_length_of :desired_name, :within => 2..100, :on => :create
-  validates_format_of :desired_name, :with => /\A[^\s:]+\Z/, :on => :create, :message => "cannot have whitespace or colons"
-  before_validation :normalize_name
-  attr_accessible :status, :user_id, :original_name, :desired_name, :change_reason, :rejection_reason, :approver_id
+  validates :desired_name, user_name: true
+
+  def initialize_attributes
+    self.user_id ||= CurrentUser.user.id
+    self.original_name ||= CurrentUser.user.name
+  end
   
   def self.pending
     where(:status => "pending")
@@ -40,10 +42,6 @@ class UserNameChangeRequest < ActiveRecord::Base
     status == "pending"
   end
   
-  def normalize_name
-    self.desired_name = desired_name.strip.gsub(/ /, "_")
-  end
-  
   def feedback
     UserFeedback.for_user(user_id).order("id desc")
   end
@@ -54,7 +52,7 @@ class UserNameChangeRequest < ActiveRecord::Base
     body = "Your name change request has been approved. Be sure to log in with your new user name."
     Dmail.create_automated(:title => "Name change request approved", :body => body, :to_id => user_id)
     UserFeedback.create(:user_id => user_id, :category => "neutral", :body => "Name changed from #{original_name} to #{desired_name}")
-    ModAction.log("Name changed from #{original_name} to #{desired_name}")
+    ModAction.log("Name changed from #{original_name} to #{desired_name}",:user_name_change)
   end
   
   def reject!(reason)
@@ -66,15 +64,6 @@ class UserNameChangeRequest < ActiveRecord::Base
   def not_limited
     if UserNameChangeRequest.where("user_id = ? and created_at >= ?", CurrentUser.user.id, 1.week.ago).exists?
       errors.add(:base, "You can only submit one name change request per week")
-      return false
-    else
-      return true
-    end
-  end
-  
-  def uniqueness_of_desired_name
-    if User.find_by_name(desired_name)
-      errors.add(:desired_name, "already exists")
       return false
     else
       return true

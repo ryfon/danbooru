@@ -1,25 +1,29 @@
 class NotesController < ApplicationController
   respond_to :html, :xml, :json, :js
-  before_filter :member_only, :except => [:index, :show]
+  before_action :member_only, :except => [:index, :show, :search]
 
   def search
   end
 
   def index
-    if params[:group_by] == "note"
-      index_by_note
-    else
-      index_by_post
+    @notes = Note.search(search_params).paginate(params[:page], :limit => params[:limit], :search_count => params[:search])
+    respond_with(@notes) do |format|
+      format.html { @notes = @notes.includes(:creator) }
+      format.xml do
+        render :xml => @notes.to_xml(:root => "notes")
+      end
     end
   end
 
   def show
     @note = Note.find(params[:id])
-    respond_with(@note)
+    respond_with(@note) do |format|
+      format.html { redirect_to(post_path(@note.post, anchor: "note-#{@note.id}")) }
+    end
   end
 
   def create
-    @note = Note.create(create_params)
+    @note = Note.create(note_params(:create))
     respond_with(@note) do |fmt|
       fmt.json do
         if @note.errors.any?
@@ -33,7 +37,7 @@ class NotesController < ApplicationController
 
   def update
     @note = Note.find(params[:id])
-    @note.update_attributes(update_params)
+    @note.update(note_params(:update))
     respond_with(@note) do |format|
       format.json do
         if @note.errors.any?
@@ -58,33 +62,12 @@ class NotesController < ApplicationController
     respond_with(@note)
   end
 
-private
-  def update_params
-    params.require(:note).permit(:x, :y, :width, :height, :body)
-  end
+  private
 
-  def create_params
-    params.require(:note).permit(:x, :y, :width, :height, :body, :post_id, :html_id)
-  end
+  def note_params(context)
+    permitted_params = %i[x y width height body]
+    permitted_params += %i[post_id html_id] if context == :create
 
-  def index_by_post
-    @post_set = PostSets::Note.new(params)
-    @posts = @post_set.posts
-    respond_with(@posts) do |format|
-      format.html {render :action => "index_by_post"}
-      format.xml do
-        render :xml => @posts.to_xml(:root => "posts")
-      end
-    end
-  end
-
-  def index_by_note
-    @notes = Note.search(params[:search]).order("id desc").paginate(params[:page], :limit => params[:limit], :search_count => params[:search])
-    respond_with(@notes) do |format|
-      format.html {render :action => "index_by_note"}
-      format.xml do
-        render :xml => @notes.to_xml(:root => "notes")
-      end
-    end
+    params.require(:note).permit(permitted_params)
   end
 end

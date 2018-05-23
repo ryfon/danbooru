@@ -1,4 +1,4 @@
-class PoolArchive < ActiveRecord::Base
+class PoolArchive < ApplicationRecord
 
   belongs_to :updater, :class_name => "User"
 
@@ -10,16 +10,19 @@ class PoolArchive < ActiveRecord::Base
   self.table_name = "pool_versions"
 
   module SearchMethods
+    def default_order
+      order(updated_at: :desc)
+    end
+
     def for_user(user_id)
       where("updater_id = ?", user_id)
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:updater_id].present?
-        q = q.for_user(params[:updater_id].to_i)
+        q = q.where(updater_id: params[:updater_id].split(",").map(&:to_i))
       end
 
       if params[:updater_name].present?
@@ -27,10 +30,10 @@ class PoolArchive < ActiveRecord::Base
       end
 
       if params[:pool_id].present?
-        q = q.where("pool_id = ?", params[:pool_id].to_i)
+        q = q.where(pool_id: params[:pool_id].split(",").map(&:to_i))
       end
 
-      q
+      q.apply_default_order(params)
     end
   end
 
@@ -43,7 +46,7 @@ class PoolArchive < ActiveRecord::Base
   def self.queue(pool)
     # queue updates to sqs so that if archives goes down for whatever reason it won't
     # block pool updates
-    raise "Archive service is not configured" if !enabled?
+    raise NotImplementedError.new("Archive service is not configured.") if !enabled?
 
     json = {
       pool_id: pool.id,
@@ -59,7 +62,7 @@ class PoolArchive < ActiveRecord::Base
       category: pool.category
     }
     msg = "add pool version\n#{json.to_json}"
-    sqs_service.send_message(msg)
+    sqs_service.send_message(msg, message_group_id: "pool:#{pool.id}")
   end
 
   def build_diff(other = nil)

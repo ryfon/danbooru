@@ -1,8 +1,6 @@
 class UsersController < ApplicationController
   respond_to :html, :xml, :json
-  before_filter :member_only, :only => [:edit, :update, :upgrade]
-  rescue_from User::PrivilegeError, :with => :access_denied
-  skip_before_filter :api_check
+  skip_before_action :api_check
 
   def new
     @user = User.new
@@ -24,10 +22,14 @@ class UsersController < ApplicationController
         redirect_to user_path(@user)
       end
     else
-      @users = User.search(params[:search]).order("users.id desc").paginate(params[:page], :limit => params[:limit], :search_count => params[:search])
+      @users = User.search(search_params).paginate(params[:page], :limit => params[:limit], :search_count => params[:search])
       respond_with(@users) do |format|
         format.xml do
           render :xml => @users.to_xml(:root => "users")
+        end
+        format.json do
+          render json: @users.to_json
+          expires_in params[:expiry].to_i.days if params[:expiry]
         end
       end
     end
@@ -39,24 +41,30 @@ class UsersController < ApplicationController
   def show
     @user = User.find(params[:id])
     @presenter = UserPresenter.new(@user)
-    respond_with(@user, :methods => [:wiki_page_version_count, :artist_version_count, :artist_commentary_version_count, :pool_version_count, :forum_post_count, :comment_count, :appeal_count, :flag_count, :positive_feedback_count, :neutral_feedback_count, :negative_feedback_count])
+    respond_with(@user, methods: @user.full_attributes)
   end
 
   def create
-    @user = User.new(params[:user], :as => CurrentUser.role)
-    @user.last_ip_addr = request.remote_ip
-    @user.save
-    if @user.errors.empty?
-      session[:user_id] = @user.id
+    @user = User.new(user_params(:create))
+    if !Danbooru.config.enable_recaptcha? || verify_recaptcha(model: @user)
+      @user.save
+      if @user.errors.empty?
+        session[:user_id] = @user.id
+      else
+        flash[:notice] = "Sign up failed: #{@user.errors.full_messages.join("; ")}"
+      end
+      set_current_user
+      respond_with(@user)
+    else
+      flash[:notice] = "Sign up failed"
+      redirect_to new_user_path
     end
-    set_current_user
-    respond_with(@user)
   end
 
   def update
     @user = User.find(params[:id])
     check_privilege(@user)
-    @user.update_attributes(params[:user].except(:name), :as => CurrentUser.role)
+    @user.update(user_params(:update))
     cookies.delete(:favorite_tags)
     cookies.delete(:favorite_tags_with_categories)
     if @user.errors.any?
@@ -64,18 +72,36 @@ class UsersController < ApplicationController
     else
       flash[:notice] = "Settings updated"
     end
-    respond_with(@user)
+    respond_with(@user) do |format|
+      format.html { redirect_back fallback_location: edit_user_path(@user) }
+    end
   end
 
-  def cache
-    @user = User.find(params[:id])
-    @user.update_cache
-    render :nothing => true
-  end
-
-private
+  private
 
   def check_privilege(user)
     raise User::PrivilegeError unless (user.id == CurrentUser.id || CurrentUser.is_admin?)
+  end
+
+  def user_params(context)
+    permitted_params = %i[
+      password old_password password_confirmation email
+      comment_threshold default_image_size favorite_tags blacklisted_tags
+      time_zone per_page custom_style
+
+      receive_email_notifications always_resize_images enable_post_navigation
+      new_post_navigation_layout enable_privacy_mode
+      enable_sequential_post_navigation hide_deleted_posts style_usernames
+      enable_auto_complete show_deleted_children
+      disable_categorized_saved_searches disable_tagged_filenames
+      enable_recent_searches disable_cropped_thumbnails disable_mobile_gestures
+      enable_safe_mode disable_responsive_mode disable_post_tooltips
+    ]
+
+    permitted_params += [dmail_filter_attributes: %i[id words]]
+    permitted_params << :name if context == :create
+    permitted_params << :level if CurrentUser.is_admin?
+
+    params.require(:user).permit(permitted_params)
   end
 end

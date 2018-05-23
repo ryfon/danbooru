@@ -11,12 +11,29 @@ class CurrentUser
     ensure
       self.user = old_user
       self.ip_addr = old_ip_addr
-      self.mobile_mode = false
     end
   end
 
+  def self.as(user, &block)
+    scoped(user, &block)
+  end
+
   def self.as_admin(&block)
-    scoped(User.admins.first, "127.0.0.1", &block)
+    if block_given?
+      scoped(User.admins.first, "127.0.0.1", &block)
+    else
+      self.user = User.admins.first
+      self.ip_addr = "127.0.0.1"
+    end
+  end
+
+  def self.as_system(&block)
+    if block_given?
+      scoped(User.system, "127.0.0.1", &block)
+    else
+      self.user = User.system
+      self.ip_addr = "127.0.0.1"
+    end
   end
 
   def self.user=(user)
@@ -35,12 +52,12 @@ class CurrentUser
     Thread.current[:current_ip_addr]
   end
 
-  def self.mobile_mode=(mode)
-    Thread.current[:mobile_mode] = mode
+  def self.root_url
+    Thread.current[:current_root_url] || "http://#{Danbooru.config.hostname}/"
   end
 
-  def self.mobile_mode?
-    Thread.current[:mobile_mode]
+  def self.root_url=(root_url)
+    Thread.current[:current_root_url] = root_url
   end
 
   def self.id
@@ -74,18 +91,10 @@ class CurrentUser
   end
 
   def self.set_safe_mode(req)
-    if req.host =~ /safe/ || req.params[:safe_mode]
-      Thread.current[:safe_mode] = true
-    else
-      Thread.current[:safe_mode] = false
-    end
+    Thread.current[:safe_mode] = Danbooru.config.enable_safe_mode?(req, CurrentUser.user)
   end
 
   def self.method_missing(method, *params, &block)
-    if user.respond_to?(method)
-      user.__send__(method, *params, &block)
-    else
-      super
-    end
+    user.__send__(method, *params, &block)
   end
 end

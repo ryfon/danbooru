@@ -1,7 +1,7 @@
 require 'digest/sha1'
 require 'danbooru/has_bit_flags'
 
-class User < ActiveRecord::Base
+class User < ApplicationRecord
   class Error < Exception ; end
   class PrivilegeError < Exception ; end
 
@@ -11,12 +11,11 @@ class User < ActiveRecord::Base
     GOLD = 30
     PLATINUM = 31
     BUILDER = 32
-    JANITOR = 35
     MODERATOR = 40
     ADMIN = 50
   end
 
-  # Used for `before_filter :<role>_only`. Must have a corresponding `is_<role>?` method.
+  # Used for `before_action :<role>_only`. Must have a corresponding `is_<role>?` method.
   Roles = Levels.constants.map(&:downcase) + [
     :anonymous,
     :banned,
@@ -26,6 +25,15 @@ class User < ActiveRecord::Base
     :verified,
   ]
 
+  # candidates for removal:
+  # - enable_post_navigation (disabled by 700)
+  # - new_post_navigation_layout (disabled by 1364)
+  # - enable_sequential_post_navigation (disabled by 680)
+  # - hide_deleted_posts (enabled by 1904)
+  # - disable_categorized_saved_searches (enabled by 2291)
+  # - disable_tagged_filenames (enabled by 387)
+  # - enable_recent_searches (enabled by 499)
+  # - disable_cropped_thumbnails (enabled by 22)
   BOOLEAN_ATTRIBUTES = %w(
     is_banned
     has_mail
@@ -46,32 +54,34 @@ class User < ActiveRecord::Base
     is_super_voter
     disable_tagged_filenames
     enable_recent_searches
+    disable_cropped_thumbnails
+    disable_mobile_gestures
+    enable_safe_mode
+    disable_responsive_mode
+    disable_post_tooltips
   )
 
   include Danbooru::HasBitFlags
   has_bit_flags BOOLEAN_ATTRIBUTES, :field => "bit_prefs"
 
   attr_accessor :password, :old_password
-  attr_accessible :dmail_filter_attributes, :enable_privacy_mode, :enable_post_navigation, :new_post_navigation_layout, :password, :old_password, :password_confirmation, :password_hash, :email, :last_logged_in_at, :last_forum_read_at, :has_mail, :receive_email_notifications, :comment_threshold, :always_resize_images, :favorite_tags, :blacklisted_tags, :name, :ip_addr, :time_zone, :default_image_size, :enable_sequential_post_navigation, :per_page, :hide_deleted_posts, :style_usernames, :enable_auto_complete, :custom_style, :show_deleted_children, :disable_categorized_saved_searches, :disable_tagged_filenames, :enable_recent_searches, :as => [:moderator, :janitor, :gold, :platinum, :member, :anonymous, :default, :builder, :admin]
-  attr_accessible :level, :as => :admin
-  validates_length_of :name, :within => 2..100, :on => :create
-  validates_format_of :name, :with => /\A[^\s:]+\Z/, :on => :create, :message => "cannot have whitespace or colons"
-  validates_format_of :name, :with => /\A[^_].*[^_]\Z/, :on => :create, :message => "cannot begin or end with an underscore"
-  validates_uniqueness_of :name, :case_sensitive => false
-  validates_uniqueness_of :email, :case_sensitive => false, :if => lambda {|rec| rec.email.present? && rec.email_changed? }
-  validates_length_of :password, :minimum => 5, :if => lambda {|rec| rec.new_record? || rec.password.present?}
+
+  after_initialize :initialize_attributes, if: :new_record?
+  validates :name, user_name: true, on: :create
+  validates_uniqueness_of :email, :case_sensitive => false, :if => ->(rec) { rec.email.present? && rec.saved_change_to_email? }
+  validates_length_of :password, :minimum => 5, :if => ->(rec) { rec.new_record? || rec.password.present?}
   validates_inclusion_of :default_image_size, :in => %w(large original)
   validates_inclusion_of :per_page, :in => 1..100
   validates_confirmation_of :password
-  validates_presence_of :email, :if => lambda {|rec| rec.new_record? && Danbooru.config.enable_email_verification?}
+  validates_presence_of :email, :if => ->(rec) { rec.new_record? && Danbooru.config.enable_email_verification?}
   validates_presence_of :comment_threshold
   validate :validate_ip_addr_is_not_banned, :on => :create
+  validate :validate_sock_puppets, :on => :create, :if => -> { Danbooru.config.enable_sock_puppet_validation? }
   before_validation :normalize_blacklisted_tags
   before_validation :set_per_page
   before_validation :normalize_email
   before_create :encrypt_password_on_create
   before_update :encrypt_password_on_update
-  before_create :initialize_default_boolean_attributes
   after_save :update_cache
   after_update :update_remote_cache
   before_create :promote_to_admin_if_first_user
@@ -79,19 +89,23 @@ class User < ActiveRecord::Base
   #after_create :notify_sock_puppets
   has_many :feedback, :class_name => "UserFeedback", :dependent => :destroy
   has_many :posts, :foreign_key => "uploader_id"
-  has_many :bans, lambda {order("bans.id desc")}
-  has_one :recent_ban, lambda {order("bans.id desc")}, :class_name => "Ban"
+  has_many :post_approvals, :dependent => :destroy
+  has_many :post_disapprovals, :dependent => :destroy
+  has_many :post_votes
+  has_many :bans, -> {order("bans.id desc")}
+  has_one :recent_ban, -> {order("bans.id desc")}, :class_name => "Ban"
+
   has_one :api_key
   has_one :dmail_filter
   has_one :super_voter
   has_one :token_bucket
-  has_many :subscriptions, lambda {order("tag_subscriptions.name")}, :class_name => "TagSubscription", :foreign_key => "creator_id"
   has_many :note_versions, :foreign_key => "updater_id"
-  has_many :dmails, lambda {order("dmails.id desc")}, :foreign_key => "owner_id"
+  has_many :dmails, -> {order("dmails.id desc")}, :foreign_key => "owner_id"
   has_many :saved_searches
-  has_many :forum_posts, lambda {order("forum_posts.created_at")}, :foreign_key => "creator_id"
-  has_many :user_name_change_requests, lambda {visible.order("user_name_change_requests.created_at desc")}
-  belongs_to :inviter, :class_name => "User"
+  has_many :forum_posts, -> {order("forum_posts.created_at, forum_posts.id")}, :foreign_key => "creator_id"
+  has_many :user_name_change_requests, -> {visible.order("user_name_change_requests.created_at desc")}
+  has_many :favorite_groups, -> {order(name: :asc)}, foreign_key: :creator_id
+  belongs_to :inviter, class_name: "User", optional: true
   after_update :create_mod_action
   accepts_nested_attributes_for :dmail_filter
 
@@ -110,7 +124,10 @@ class User < ActiveRecord::Base
     def unban!
       self.is_banned = false
       save
-      ban.destroy
+    end
+
+    def ban_expired?
+      is_banned? && recent_ban.try(:expired?)
     end
   end
 
@@ -135,8 +152,13 @@ class User < ActiveRecord::Base
 
     module ClassMethods
       def name_to_id(name)
-        Cache.get("uni:#{Cache.sanitize(name)}", 4.hours) do
-          select_value_sql("SELECT id FROM users WHERE lower(name) = ?", name.mb_chars.downcase.tr(" ", "_").to_s)
+        Cache.get("uni:#{Cache.hash(name)}", 4.hours) do
+          val = select_value_sql("SELECT id FROM users WHERE lower(name) = ?", name.mb_chars.downcase.tr(" ", "_").to_s)
+          if val.present?
+            val.to_i
+          else
+            nil
+          end
         end
       end
 
@@ -153,6 +175,10 @@ class User < ActiveRecord::Base
       def id_to_pretty_name(user_id)
         id_to_name(user_id).gsub(/([^_])_+(?=[^_])/, "\\1 \\2")
       end
+
+      def normalize_name(name)
+        name.to_s.mb_chars.downcase.strip.tr(" ", "_").to_s
+      end
     end
 
     def pretty_name
@@ -160,14 +186,14 @@ class User < ActiveRecord::Base
     end
 
     def update_cache
-      Cache.put("uin:#{id}", name)
-      Cache.put("uni:#{Cache.sanitize(name)}", id)
+      Cache.put("uin:#{id}", name, 4.hours)
+      Cache.put("uni:#{Cache.hash(name)}", id, 4.hours)
     end
 
     def update_remote_cache
-      if name_changed?
+      if saved_change_to_name?
         Danbooru.config.other_server_hosts.each do |server|
-          Net::HTTP.delete(URI.parse("http://#{server}/users/#{id}/cache"))
+          delay(queue: server).update_cache
         end
       end
     rescue Exception
@@ -197,7 +223,7 @@ class User < ActiveRecord::Base
         self.bcrypt_password_hash = User.bcrypt(password)
         return true
       else
-        errors[:old_password] = "is incorrect"
+        errors[:old_password] << "is incorrect"
         return false
       end
     end
@@ -273,25 +299,12 @@ class User < ActiveRecord::Base
       Favorite.where("user_id % 100 = #{id % 100} and user_id = #{id}").order("id desc")
     end
 
-    def clean_favorite_count?
-      favorite_count < 0 || Kernel.rand(100) < [Math.log(favorite_count, 2), 5].min
-    end
-
-    def clean_favorite_count!
-      update_column(:favorite_count, Favorite.for_user(id).count)
-    end
-
     def add_favorite!(post)
-      Favorite.add(post, self)
-      clean_favorite_count! if clean_favorite_count?
+      Favorite.add(post: post, user: self)
     end
 
     def remove_favorite!(post)
-      Favorite.remove(post, self)
-    end
-
-    def favorite_groups
-      FavoriteGroup.for_creator(CurrentUser.user.id).order("updated_at desc")
+      Favorite.remove(post: post, user: self)
     end
   end
 
@@ -299,13 +312,16 @@ class User < ActiveRecord::Base
     extend ActiveSupport::Concern
 
     module ClassMethods
+      def system
+        User.find_by!(name: Danbooru.config.system_user)
+      end
+
       def level_hash
         return {
           "Member" => Levels::MEMBER,
           "Gold" => Levels::GOLD,
           "Platinum" => Levels::PLATINUM,
           "Builder" => Levels::BUILDER,
-          "Janitor" => Levels::JANITOR,
           "Moderator" => Levels::MODERATOR,
           "Admin" => Levels::ADMIN
         }
@@ -328,9 +344,6 @@ class User < ActiveRecord::Base
         when Levels::PLATINUM
           "Platinum"
 
-        when Levels::JANITOR
-          "Janitor"
-
         when Levels::MODERATOR
           "Moderator"
 
@@ -350,7 +363,7 @@ class User < ActiveRecord::Base
     def promote_to_admin_if_first_user
       return if Rails.env.test?
 
-      if User.count == 0
+      if User.admins.count == 0
         self.level = Levels::ADMIN
         self.can_approve_posts = true
         self.can_upload_free = true
@@ -366,6 +379,10 @@ class User < ActiveRecord::Base
 
     def role
       level_string.downcase.to_sym
+    end
+
+    def level_string_before_last_save
+      level_string(level_before_last_save)
     end
 
     def level_string_was
@@ -400,10 +417,6 @@ class User < ActiveRecord::Base
       level >= Levels::PLATINUM
     end
 
-    def is_janitor?
-      level >= Levels::JANITOR
-    end
-
     def is_moderator?
       level >= Levels::MODERATOR
     end
@@ -425,11 +438,11 @@ class User < ActiveRecord::Base
     end
 
     def create_mod_action
-      if level_changed?
-        ModAction.log(%{"#{name}":/users/#{id} level changed #{level_string_was} -> #{level_string}})
+      if saved_change_to_level?
+        ModAction.log(%{"#{name}":/users/#{id} level changed #{level_string_before_last_save} -> #{level_string}},:user_level)
       end
     end
-    
+
     def set_per_page
       if per_page.nil? || !is_gold?
         self.per_page = Danbooru.config.posts_per_page
@@ -542,6 +555,36 @@ class User < ActiveRecord::Base
       created_at <= 1.week.ago
     end
 
+    def can_view_flagger?(flagger_id)
+      is_moderator? || flagger_id == id
+    end
+
+    def can_view_flagger_on_post?(flag)
+      (is_moderator? && flag.not_uploaded_by?(id)) || flag.creator_id == id
+    end
+
+    def upload_limit
+      @upload_limit ||= [max_upload_limit - used_upload_slots, 0].max
+    end
+
+    def used_upload_slots
+      uploaded_count = Post.for_user(id).where("created_at >= ?", 23.hours.ago).count
+      uploaded_comic_count = Post.for_user(id).tag_match("comic").where("created_at >= ?", 23.hours.ago).count / 3
+      uploaded_count - uploaded_comic_count
+    end
+
+    def max_upload_limit
+      [(base_upload_limit * upload_limit_multiplier).ceil, 10].max
+    end
+
+    def upload_limit_multiplier
+      (1 - (adjusted_deletion_confidence / 15.0))
+    end
+
+    def adjusted_deletion_confidence
+      [deletion_confidence(60), 15].min
+    end
+
     def base_upload_limit
       if created_at >= 1.month.ago
         10
@@ -556,23 +599,8 @@ class User < ActiveRecord::Base
       end
     end
 
-    def max_upload_limit
-      dcon = [deletion_confidence(60), 15].min
-      [(base_upload_limit * (1 - (dcon / 15.0))).ceil, 10].max
-    end
-
-    def upload_limit
-      @upload_limit ||= begin
-        uploaded_count = Post.for_user(id).where("created_at >= ?", 24.hours.ago).count
-        uploaded_comic_count = Post.for_user(id).tag_match("comic").where("created_at >= ?", 24.hours.ago).count / 3
-        limit = max_upload_limit - (uploaded_count - uploaded_comic_count)
-
-        if limit < 0
-          limit = 0
-        end
-
-        limit
-      end
+    def next_free_upload_slot
+      (posts.where("created_at >= ?", 23.hours.ago).first.try(:created_at) || 23.hours.ago) + 23.hours
     end
 
     def tag_query_limit
@@ -607,9 +635,9 @@ class User < ActiveRecord::Base
 
     def api_regen_multiplier
       # regen this amount per second
-      if is_platinum? && api_key.present?
+      if is_platinum?
         4
-      elsif is_gold? && api_key.present?
+      elsif is_gold?
         2
       else
         1
@@ -619,9 +647,9 @@ class User < ActiveRecord::Base
     def api_burst_limit
       # can make this many api calls at once before being bound by
       # api_regen_multiplier refilling your pool
-      if is_platinum? && api_key.present?
+      if is_platinum?
         60
-      elsif is_gold? && api_key.present?
+      elsif is_gold?
         30
       else
         10
@@ -644,16 +672,45 @@ class User < ActiveRecord::Base
   end
 
   module ApiMethods
+    # blacklist all attributes by default. whitelist only safe attributes.
     def hidden_attributes
-      super + [:password_hash, :bcrypt_password_hash, :email, :email_verification_key, :time_zone, :updated_at, :receive_email_notifications, :last_logged_in_at, :last_forum_read_at, :has_mail, :default_image_size, :comment_threshold, :always_resize_images, :favorite_tags, :blacklisted_tags, :recent_tags, :enable_privacy_mode, :enable_post_navigation, :new_post_navigation_layout, :enable_sequential_post_navigation, :hide_deleted_posts, :per_page, :style_usernames, :enable_auto_complete, :custom_style, :show_deleted_children, :has_saved_searches, :last_ip_addr, :bit_prefs, :favorite_count]
+      super + attributes.keys.map(&:to_sym)
     end
 
     def method_attributes
-      list = super + [:is_banned, :can_approve_posts, :can_upload_free, :is_super_voter, :level_string]
+      list = super + [
+        :id, :created_at, :name, :inviter_id, :level, :base_upload_limit,
+        :post_upload_count, :post_update_count, :note_update_count,
+        :is_banned, :can_approve_posts, :can_upload_free, :is_super_voter,
+        :level_string,
+      ]
+
       if id == CurrentUser.user.id
-        list += [:remaining_api_limit, :api_burst_limit]
+        list += BOOLEAN_ATTRIBUTES + [
+          :updated_at, :email, :last_logged_in_at, :last_forum_read_at,
+          :recent_tags, :comment_threshold, :default_image_size,
+          :favorite_tags, :blacklisted_tags, :time_zone, :per_page,
+          :custom_style, :favorite_count,
+          :api_regen_multiplier, :api_burst_limit, :remaining_api_limit,
+          :statement_timeout, :favorite_group_limit, :favorite_limit,
+          :tag_query_limit, :can_comment_vote?, :can_remove_from_pools?,
+          :is_comment_limited?, :can_comment?, :can_upload?, :max_saved_searches,
+        ]
       end
+
       list
+    end
+
+    # extra attributes returned for /users/:id.json but not for /users.json.
+    def full_attributes
+      [
+        :wiki_page_version_count, :artist_version_count,
+        :artist_commentary_version_count, :pool_version_count,
+        :forum_post_count, :comment_count, :favorite_group_count,
+        :appeal_count, :flag_count, :positive_feedback_count,
+        :neutral_feedback_count, :negative_feedback_count, :upload_limit,
+        :max_upload_limit
+      ]
     end
 
     def to_legacy_json
@@ -680,6 +737,7 @@ class User < ActiveRecord::Base
     end
 
     def pool_version_count
+      return nil unless PoolArchive.enabled?
       PoolArchive.for_user(id).count
     end
 
@@ -692,7 +750,7 @@ class User < ActiveRecord::Base
     end
 
     def favorite_group_count
-      FavoriteGroup.for_creator(id).count
+      favorite_groups.count
     end
 
     def appeal_count
@@ -756,8 +814,7 @@ class User < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:name].present?
         q = q.name_matches(params[:name].mb_chars.downcase.strip.tr(" ", "_"))
@@ -779,10 +836,6 @@ class User < ActiveRecord::Base
         q = q.where("level = ?", params[:level].to_i)
       end
 
-      if params[:id].present?
-        q = q.where("id in (?)", params[:id].split(",").map(&:to_i))
-      end
-
       bitprefs_length = BOOLEAN_ATTRIBUTES.length
       bitprefs_include = nil
       bitprefs_exclude = nil
@@ -790,10 +843,10 @@ class User < ActiveRecord::Base
       [:can_approve_posts, :can_upload_free, :is_super_voter].each do |x|
         if params[x].present?
           attr_idx = BOOLEAN_ATTRIBUTES.index(x.to_s)
-          if params[x] == "true"
+          if params[x].to_s.truthy?
             bitprefs_include ||= "0"*bitprefs_length
             bitprefs_include[attr_idx] = '1'
-          elsif params[x] == "false"
+          elsif params[x].to_s.falsy?
             bitprefs_exclude ||= "0"*bitprefs_length
             bitprefs_exclude[attr_idx] = '1'
           end
@@ -812,25 +865,21 @@ class User < ActiveRecord::Base
                     {:len => bitprefs_length, :bits => bitprefs_exclude})
       end
 
-      if params[:current_user_first] == "true" && !CurrentUser.is_anonymous?
+      if params[:current_user_first].to_s.truthy? && !CurrentUser.is_anonymous?
         q = q.order("id = #{CurrentUser.user.id.to_i} desc")
       end
       
       case params[:order]
       when "name"
         q = q.order("name")
-
       when "post_upload_count"
         q = q.order("post_upload_count desc")
-
       when "note_count"
         q = q.order("note_update_count desc")
-
       when "post_update_count"
         q = q.order("post_update_count desc")
-
       else
-        q = q.order("created_at desc")
+        q = q.apply_default_order(params)
       end
 
       q
@@ -843,33 +892,10 @@ class User < ActiveRecord::Base
     end
   end
 
-  module SavedSearchMethods
-    def unique_saved_search_categories
-      if SavedSearch.enabled?
-        categories = saved_searches.pluck(:category)
-        
-        if categories.any? {|x| x.blank?}
-          categories.reject! {|x| x.blank?}
-          categories.unshift(SavedSearch::UNCATEGORIZED_NAME)
-        end
-        
-        categories.uniq!
-        categories
-      else
-        []
-      end
-    end
-  end
-
-  module SockPuppetMethods
-    def notify_sock_puppets
-      sock_puppet_suspects.each do |user|
-      end
-    end
-
-    def sock_puppet_suspects
-      if last_ip_addr.present?
-        User.where(:last_ip_addr => last_ip_addr)
+  concerning :SockPuppetMethods do
+    def validate_sock_puppets
+      if User.where(last_ip_addr: CurrentUser.ip_addr).where("created_at > ?", 1.day.ago).exists?
+        errors.add(:last_ip_addr, "was used recently for another account and cannot be reused for another day")
       end
     end
   end
@@ -889,10 +915,9 @@ class User < ActiveRecord::Base
   include CountMethods
   extend SearchMethods
   include StatisticsMethods
-  include SavedSearchMethods
 
-  def initialize_default_image_size
-    self.default_image_size = "large"
+  def as_current(&block)
+    CurrentUser.as(self, &block)
   end
 
   def can_update?(object, foreign_key = :user_id)
@@ -901,20 +926,25 @@ class User < ActiveRecord::Base
 
   def dmail_count
     if has_mail?
-      "(#{dmails.unread.count})"
+      "(#{unread_dmail_count})"
     else
       ""
     end
   end
 
   def hide_favorites?
-    enable_privacy_mode? && CurrentUser.user.id != id
+    !CurrentUser.is_admin? && enable_privacy_mode? && CurrentUser.user.id != id
   end
 
-  def initialize_default_boolean_attributes
+  def initialize_attributes
+    self.last_ip_addr ||= CurrentUser.ip_addr
     self.enable_post_navigation = true
     self.new_post_navigation_layout = true
     self.enable_sequential_post_navigation = true
     self.enable_auto_complete = true
+  end
+
+  def presenter
+    @presenter ||= UserPresenter.new(self)
   end
 end

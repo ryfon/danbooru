@@ -3,7 +3,7 @@ module Maintenance
     class EmailNotificationsController < ApplicationController
       class VerificationError < Exception ; end
 
-      before_filter :validate_sig, :only => [:destroy]
+      before_action :validate_sig, :only => [:destroy]
       rescue_from VerificationError, :with => :render_403
 
       def show
@@ -18,13 +18,13 @@ module Maintenance
     private
 
       def render_403
-        render :nothing => true, :status => 403
+        render plain: "", :status => 403
       end
 
       def validate_sig
-        digest = OpenSSL::Digest.new("sha256")
-        calc_sig = OpenSSL::HMAC.hexdigest(digest, Danbooru.config.email_key, params[:user_id].to_s)
-        if calc_sig != params[:sig]
+        verifier = ActiveSupport::MessageVerifier.new(Danbooru.config.email_key, digest: "SHA256", serializer: JSON)
+        calculated_sig = verifier.generate(params[:user_id].to_s)
+        if calculated_sig != params[:sig]
           raise VerificationError.new
         end
       end

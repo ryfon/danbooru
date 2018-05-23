@@ -1,11 +1,15 @@
 require 'danbooru/has_bit_flags'
 require 'google/apis/pubsub_v1'
 
-class Post < ActiveRecord::Base
+class Post < ApplicationRecord
   class ApprovalError < Exception ; end
   class DisapprovalError < Exception ; end
   class RevertError < Exception ; end
   class SearchError < Exception ; end
+  class DeletionError < Exception ; end
+
+  # Tags to copy when copying notes.
+  NOTE_COPY_TAGS = %w[translated partially_translated check_translation translation_request reverse_translation]
 
   before_validation :initialize_uploader, :on => :create
   before_validation :merge_old_changes
@@ -17,6 +21,11 @@ class Post < ActiveRecord::Base
   validates_uniqueness_of :md5, :on => :create
   validates_inclusion_of :rating, in: %w(s q e), message: "rating must be s, q, or e"
   validate :tag_names_are_valid
+  validate :added_tags_are_valid
+  validate :removed_tags_are_valid
+  validate :has_artist_tag
+  validate :has_copyright_tag
+  validate :has_enough_tags
   validate :post_is_not_its_own_parent
   validate :updater_can_change_rating
   before_save :update_tag_post_counts
@@ -27,164 +36,153 @@ class Post < ActiveRecord::Base
   after_save :update_parent_on_save
   after_save :apply_post_metatags
   after_save :expire_essential_tag_string_cache
-  after_destroy :remove_iqdb_async
-  after_destroy :delete_files
-  after_destroy :delete_remote_files
+  after_commit :delete_files, :on => :destroy
+  after_commit :remove_iqdb_async, :on => :destroy
   after_commit :update_iqdb_async, :on => :create
   after_commit :notify_pubsub
 
-  belongs_to :updater, :class_name => "User"
-  belongs_to :approver, :class_name => "User"
-  belongs_to :uploader, :class_name => "User"
-  belongs_to :parent, :class_name => "Post"
+  belongs_to :updater, :class_name => "User", optional: true # this is handled in versions
+  belongs_to :approver, class_name: "User", optional: true
+  belongs_to :uploader, :class_name => "User", :counter_cache => "post_upload_count"
+  belongs_to :parent, class_name: "Post", optional: true
   has_one :upload, :dependent => :destroy
   has_one :artist_commentary, :dependent => :destroy
   has_one :pixiv_ugoira_frame_data, :class_name => "PixivUgoiraFrameData", :dependent => :destroy
   has_many :flags, :class_name => "PostFlag", :dependent => :destroy
   has_many :appeals, :class_name => "PostAppeal", :dependent => :destroy
-  has_many :versions, lambda {order("post_versions.updated_at ASC, post_versions.id ASC")}, :class_name => "PostVersion", :dependent => :destroy
   has_many :votes, :class_name => "PostVote", :dependent => :destroy
   has_many :notes, :dependent => :destroy
-  has_many :comments, lambda {includes(:creator, :updater).order("comments.id")}, :dependent => :destroy
-  has_many :children, lambda {order("posts.id")}, :class_name => "Post", :foreign_key => "parent_id"
+  has_many :comments, -> {includes(:creator, :updater).order("comments.id")}, :dependent => :destroy
+  has_many :children, -> {order("posts.id")}, :class_name => "Post", :foreign_key => "parent_id"
+  has_many :approvals, :class_name => "PostApproval", :dependent => :destroy
   has_many :disapprovals, :class_name => "PostDisapproval", :dependent => :destroy
-  has_many :favorites, :dependent => :destroy
-  attr_accessible :source, :rating, :tag_string, :old_tag_string, :old_parent_id, :old_source, :old_rating, :parent_id, :has_embedded_notes, :as => [:member, :builder, :gold, :platinum, :janitor, :moderator, :admin, :default]
-  attr_accessible :is_rating_locked, :is_note_locked, :as => [:builder, :janitor, :moderator, :admin]
-  attr_accessible :is_status_locked, :as => [:admin]
+  has_many :favorites
+  has_many :replacements, class_name: "PostReplacement", :dependent => :destroy
+
+  serialize :keeper_data, JSON
   attr_accessor :old_tag_string, :old_parent_id, :old_source, :old_rating, :has_constraints, :disable_versioning, :view_count
 
-  module FileMethods
-    def distribute_files
-      RemoteFileManager.new(file_path).distribute
-      RemoteFileManager.new(preview_file_path).distribute if has_preview?
-      RemoteFileManager.new(large_file_path).distribute if has_large?
+  concerning :KeeperMethods do
+    included do
+      before_create :initialize_keeper
     end
 
-    def delete_remote_files
-      RemoteFileManager.new(file_path).delete
-      RemoteFileManager.new(preview_file_path).delete if has_preview?
-      RemoteFileManager.new(large_file_path).delete if has_large?
+    def keeper_id
+      if PostKeeperManager.enabled?
+        (keeper_data && keeper_data["uid"]) ? keeper_data["uid"] : uploader_id
+      else
+        uploader_id
+      end
+    end
+  
+    def keeper
+      User.find(keeper_id)
+    end
+
+    def initialize_keeper
+      self.keeper_data = {uid: uploader_id}
+    end
+  end
+
+  if PostArchive.enabled?
+    has_many :versions, -> {order("post_versions.updated_at ASC")}, :class_name => "PostArchive", :dependent => :destroy
+  end
+
+  module FileMethods
+    extend ActiveSupport::Concern
+
+    module ClassMethods
+      def delete_files(post_id, md5, file_ext, force: false)
+        if Post.where(md5: md5).exists? && !force
+          raise DeletionError.new("Files still in use; skipping deletion.")
+        end
+
+        Danbooru.config.storage_manager.delete_file(post_id, md5, file_ext, :original)
+        Danbooru.config.storage_manager.delete_file(post_id, md5, file_ext, :large)
+        Danbooru.config.storage_manager.delete_file(post_id, md5, file_ext, :preview)
+
+        Danbooru.config.backup_storage_manager.delete_file(post_id, md5, file_ext, :original)
+        Danbooru.config.backup_storage_manager.delete_file(post_id, md5, file_ext, :large)
+        Danbooru.config.backup_storage_manager.delete_file(post_id, md5, file_ext, :preview)
+
+        if Danbooru.config.cloudflare_key
+          CloudflareService.new.delete(md5, file_ext)
+        end
+      end
+    end
+
+    def queue_delete_files(grace_period)
+      Post.delay(queue: "default", run_at: Time.now + grace_period).delete_files(id, md5, file_ext)
     end
 
     def delete_files
-      FileUtils.rm_f(file_path)
-      FileUtils.rm_f(large_file_path)
-      FileUtils.rm_f(preview_file_path)
+      Post.delete_files(id, md5, file_ext, force: true)
     end
 
-    def file_path_prefix
-      Rails.env == "test" ? "test." : ""
+    def distribute_files(file, sample_file, preview_file)
+      storage_manager.store_file(file, self, :original)
+      storage_manager.store_file(sample_file, self, :large) if sample_file.present?
+      storage_manager.store_file(preview_file, self, :preview) if preview_file.present?
+
+      backup_storage_manager.store_file(file, self, :original)
+      backup_storage_manager.store_file(sample_file, self, :large) if sample_file.present?
+      backup_storage_manager.store_file(preview_file, self, :preview) if preview_file.present?
     end
 
-    def file_path
-      "#{Rails.root}/public/data/#{file_path_prefix}#{md5}.#{file_ext}"
+    def backup_storage_manager
+      Danbooru.config.backup_storage_manager
     end
 
-    def large_file_path
-      if has_large?
-        "#{Rails.root}/public/data/sample/#{file_path_prefix}#{Danbooru.config.large_image_prefix}#{md5}.#{large_file_ext}"
-      else
-        file_path
-      end
+    def storage_manager
+      Danbooru.config.storage_manager
     end
 
-    def large_file_ext
-      if is_ugoira?
-        "webm"
-      else
-        "jpg"
-      end
+    def file(type = :original)
+      storage_manager.open_file(self, type)
     end
 
-    def preview_file_path
-      "#{Rails.root}/public/data/preview/#{file_path_prefix}#{md5}.jpg"
+    def tagged_file_url
+      storage_manager.file_url(self, :original, tagged_filenames: !CurrentUser.user.disable_tagged_filenames?)
     end
 
-    def file_name
-      "#{file_path_prefix}#{md5}.#{file_ext}"
+    def tagged_large_file_url
+      storage_manager.file_url(self, :large, tagged_filenames: !CurrentUser.user.disable_tagged_filenames?)
     end
 
     def file_url
-      # if cdn_hosted?
-      #   Danbooru.config.danbooru_s3_base_url + "/#{file_path_prefix}#{md5}.#{file_ext}"
-      # else
-        "/data/#{seo_tag_string}#{file_path_prefix}#{md5}.#{file_ext}"
-      # end
+      storage_manager.file_url(self, :original)
     end
 
     def large_file_url
-      if has_large?
-        "/data/sample/#{seo_tag_string}#{file_path_prefix}#{Danbooru.config.large_image_prefix}#{md5}.#{large_file_ext}"
-      else
-        file_url
-      end
-    end
-
-    def seo_tag_string
-      if Danbooru.config.enable_seo_post_urls && !CurrentUser.user.disable_tagged_filenames?
-        "__#{seo_tags}__"
-      else
-        nil
-      end
-    end
-
-    def seo_tags
-      @seo_tags ||= humanized_essential_tag_string.gsub(/[^a-z0-9]+/, "_").gsub(/(?:^_+)|(?:_+$)/, "").gsub(/_{2,}/, "_")
+      storage_manager.file_url(self, :large)
     end
 
     def preview_file_url
-      if !has_preview?
-        return "/images/download-preview.png"
-      end
-
-      "/data/preview/#{file_path_prefix}#{md5}.jpg"
+      storage_manager.file_url(self, :preview)
     end
 
-    def complete_preview_file_url
-      "http://#{Danbooru.config.hostname}#{preview_file_url}"
+    def open_graph_image_url
+      if is_image?
+        if has_large?
+          large_file_url
+        else
+          file_url
+        end
+      else
+        preview_file_url
+      end
     end
 
     def file_url_for(user)
-      if CurrentUser.mobile_mode?
-        large_file_url
-      elsif user.default_image_size == "large" && image_width > Danbooru.config.large_image_width
-        large_file_url
+      if user.default_image_size == "large" && image_width > Danbooru.config.large_image_width
+        tagged_large_file_url
       else
-        file_url
-      end
-    end
-
-    def file_path_for(user)
-      if CurrentUser.mobile_mode?
-        large_file_path
-      elsif user.default_image_size == "large" && image_width > Danbooru.config.large_image_width
-        large_file_path
-      else
-        file_path
+        tagged_file_url
       end
     end
 
     def is_image?
       file_ext =~ /jpg|jpeg|gif|png/i
-    end
-
-    def is_animated_gif?
-      if file_ext =~ /gif/i
-        return Magick::Image.ping(file_path).length > 1
-      else
-        return false
-      end
-    end
-    
-    def is_animated_png?
-      if file_ext =~ /png/i && File.exists?(file_path)
-        apng = APNGInspector.new(file_path)
-        apng.inspect!
-        return apng.animated?
-      else
-        return false
-      end
     end
 
     def is_flash?
@@ -216,19 +214,11 @@ class Post < ActiveRecord::Base
     end
 
     def has_ugoira_webm?
-      created_at < 1.minute.ago || (File.exists?(preview_file_path) && File.size(preview_file_path) > 0)
+      true
     end
   end
 
   module ImageMethods
-    def device_scale
-      if large_image_width > 320
-        320.0 / (large_image_width + 10)
-      else
-        1.0
-      end
-    end
-
     def twitter_card_supported?
       image_width.to_i >= 280 && image_height.to_i >= 150
     end
@@ -261,7 +251,7 @@ class Post < ActiveRecord::Base
     end
 
     def image_width_for(user)
-      if CurrentUser.mobile_mode? || user.default_image_size == "large"
+      if user.default_image_size == "large"
         large_image_width
       else
         image_width
@@ -269,7 +259,7 @@ class Post < ActiveRecord::Base
     end
 
     def image_height_for(user)
-      if CurrentUser.mobile_mode? || user.default_image_size == "large"
+      if user.default_image_size == "large"
         large_image_height
       else
         image_height
@@ -282,22 +272,16 @@ class Post < ActiveRecord::Base
   end
 
   module ApprovalMethods
-    def is_approvable?
-      !is_status_locked? && (is_pending? || is_flagged? || is_deleted?) && !PostApproval.approved?(CurrentUser.id, id)
+    def is_approvable?(user = CurrentUser.user)
+      !is_status_locked? && (is_pending? || is_flagged? || is_deleted?) && !approved_by?(user)
     end
 
     def flag!(reason, options = {})
-      if is_status_locked?
-        raise PostFlag::Error.new("Post is locked and cannot be flagged")
-      end
-
       flag = flags.create(:reason => reason, :is_resolved => false, :is_deletion => options[:is_deletion])
 
       if flag.errors.any?
         raise PostFlag::Error.new(flag.errors.full_messages.join("; "))
       end
-
-      update_column(:is_flagged, true) unless is_flagged?
     end
 
     def appeal!(reason)
@@ -312,35 +296,12 @@ class Post < ActiveRecord::Base
       end
     end
 
-    def approve!
-      if is_status_locked?
-        errors.add(:is_status_locked, "; post cannot be approved")
-        raise ApprovalError.new("Post is locked and cannot be approved")
-      end
+    def approve!(approver = CurrentUser.user)
+      approvals.create(user: approver)
+    end
 
-      if uploader_id == CurrentUser.id
-        errors.add(:base, "You cannot approve a post you uploaded")
-        raise ApprovalError.new("You cannot approve a post you uploaded")
-      end
-
-      if approver_id == CurrentUser.id || PostApproval.approved?(CurrentUser.id, id)
-        errors.add(:approver, "have already approved this post")
-        raise ApprovalError.new("You have previously approved this post and cannot approve it again")
-      end
-
-      flags.each {|x| x.resolve!}
-      self.is_flagged = false
-      self.is_pending = false
-      self.is_deleted = false
-      self.approver_id = CurrentUser.id
-
-      PostApproval.create(user_id: CurrentUser.id, post_id: id)
-
-      if is_deleted_was == true
-        ModAction.log("undeleted post ##{id}")
-      end
-
-      save!
+    def approved_by?(user)
+      approver == user || approvals.where(user: user).exists?
     end
 
     def disapproved_by?(user)
@@ -383,15 +344,17 @@ class Post < ActiveRecord::Base
 
     def normalized_source
       case source
-      when %r{\Ahttps?://img\d+\.pixiv\.net/img/[^\/]+/(\d+)}i, %r{\Ahttps?://i\d\.pixiv\.net/img\d+/img/[^\/]+/(\d+)}i
+      when %r{\Ahttps?://img\d+\.pixiv\.net/img/[^\/]+/(\d+)}i, 
+           %r{\Ahttps?://i\d\.pixiv\.net/img\d+/img/[^\/]+/(\d+)}i
         "http://www.pixiv.net/member_illust.php?mode=medium&illust_id=#{$1}"
 
-      when %r{\Ahttps?://i\d+\.pixiv\.net/img-original/img/(?:\d+\/)+(\d+)_p}i,
-           %r{\Ahttps?://i\d+\.pixiv\.net/c/\d+x\d+/img-master/img/(?:\d+\/)+(\d+)_p}i,
-           %r{\Ahttps?://i\d+\.pixiv\.net/img-zip-ugoira/img/(?:\d+\/)+(\d+)_ugoira\d+x\d+\.zip}i
+      when %r{\Ahttps?://(?:i\d+\.pixiv\.net|i\.pximg\.net)/img-(?:master|original)/img/(?:\d+\/)+(\d+)_p}i,
+           %r{\Ahttps?://(?:i\d+\.pixiv\.net|i\.pximg\.net)/c/\d+x\d+/img-master/img/(?:\d+\/)+(\d+)_p}i,
+           %r{\Ahttps?://(?:i\d+\.pixiv\.net|i\.pximg\.net)/img-zip-ugoira/img/(?:\d+\/)+(\d+)_ugoira\d+x\d+\.zip}i
         "http://www.pixiv.net/member_illust.php?mode=medium&illust_id=#{$1}"
 
-      when %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/(\d+)\?e=\d+&h=[a-f0-9]+}i, %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/[a-f0-9]+/\d+/(\d+)}i
+      when %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/(\d+)\?e=\d+&h=[a-f0-9]+}i, 
+           %r{\Ahttps?://lohas\.nicoseiga\.jp/priv/[a-f0-9]+/\d+/(\d+)}i
         "http://seiga.nicovideo.jp/seiga/im#{$1}"
 
       when %r{\Ahttps?://(?:d3j5vwomefv46c|dn3pm25xmtlyu)\.cloudfront\.net/photos/large/(\d+)\.}i
@@ -399,11 +362,27 @@ class Post < ActiveRecord::Base
         base_36_id = base_10_id.to_s(36)
         "http://twitpic.com/#{base_36_id}"
 
-      when %r{\Ahttps?://(?:fc|th|pre|orig|img)\d{2}\.deviantart\.net/.+/[a-z0-9_]*_by_([a-z0-9_]+)-d([a-z0-9]+)\.}i
-        "http://#{$1}.deviantart.com/gallery/#/d#{$2}"
+      # http://orig12.deviantart.net/9b69/f/2017/023/7/c/illustration___tokyo_encount_oei__by_melisaongmiqin-dawi58s.png
+      # http://pre15.deviantart.net/81de/th/pre/f/2015/063/5/f/inha_by_inhaestudios-d8kfzm5.jpg
+      # http://th00.deviantart.net/fs71/PRE/f/2014/065/3/b/goruto_by_xyelkiltrox-d797tit.png
+      # http://th04.deviantart.net/fs70/300W/f/2009/364/4/d/Alphes_Mimic___Rika_by_Juriesute.png
+      # http://fc02.deviantart.net/fs48/f/2009/186/2/c/Animation_by_epe_tohri.swf
+      # http://fc08.deviantart.net/files/f/2007/120/c/9/Cool_Like_Me_by_47ness.jpg
+      # http://fc08.deviantart.net/images3/i/2004/088/8/f/Blackrose_for_MuzicFreq.jpg
+      # http://img04.deviantart.net/720b/i/2003/37/9/6/princess_peach.jpg
+      when %r{\Ahttps?://(?:(?:fc|th|pre|orig|img|prnt)\d{2}|origin-orig)\.deviantart\.net/.+/(?<title>[a-z0-9_]+)_by_(?<artist>[a-z0-9_]+)-d(?<id>[a-z0-9]+)\.}i
+        artist = $~[:artist].dasherize
+        title = $~[:title].titleize.strip.squeeze(" ").tr(" ", "-")
+        id = $~[:id].to_i(36)
+        "http://#{artist}.deviantart.com/art/#{title}-#{id}"
 
-      when %r{\Ahttps?://(?:fc|th|pre|orig|img)\d{2}\.deviantart\.net/.+/[a-f0-9]+-d([a-z0-9]+)\.}i
-        "http://deviantart.com/gallery/#/d#{$1}"
+      # http://prnt00.deviantart.net/9b74/b/2016/101/4/468a9d89f52a835d4f6f1c8caca0dfb2-pnjfbh.jpg
+      # http://fc00.deviantart.net/fs71/f/2013/234/d/8/d84e05f26f0695b1153e9dab3a962f16-d6j8jl9.jpg
+      # http://th04.deviantart.net/fs71/PRE/f/2013/337/3/5/35081351f62b432f84eaeddeb4693caf-d6wlrqs.jpg
+      # http://fc09.deviantart.net/fs22/o/2009/197/3/7/37ac79eaeef9fb32e6ae998e9a77d8dd.jpg
+      when %r{\Ahttps?://(?:fc|th|pre|orig|img|prnt)\d{2}\.deviantart\.net/.+/[a-f0-9]{32}-d(?<id>[a-z0-9]+)\.}i
+        id = $~[:id].to_i(36)
+        "http://deviantart.com/deviation/#{id}"
 
       when %r{\Ahttp://www\.karabako\.net/images(?:ub)?/karabako_(\d+)(?:_\d+)?\.}i
         "http://www.karabako.net/post/view/#{$1}"
@@ -505,6 +484,11 @@ class Post < ActiveRecord::Base
       # https://yande.re/sample/ceb6a12e87945413a95b90fada406f91/.jpg
       when %r{\Ahttps?://(?:ayase\.|yuno\.|files\.)?yande\.re/(?:image|jpeg|sample)/(?<md5>[a-z0-9]{32})(?:/yande\.re.*|/?\.(?:jpg|png))\Z}i
         "https://yande.re/post?tags=md5:#{$~[:md5]}"
+
+      # https://gfee_li.artstation.com/projects/XPGOD
+      # https://gfee_li.artstation.com/projects/asuka-7
+      when %r{\Ahttps?://\w+\.artstation.com/(?:artwork|projects)/(?<project_id>[a-z0-9-]+)\z/}i
+        "https://www.artstation.com/artwork/#{$~[:project_id]}"
         
       when %r{\Ahttps?://(?:o|image-proxy-origin)\.twimg\.com/\d/proxy\.jpg\?t=(\w+)&}i
         str = Base64.decode64($1)
@@ -525,6 +509,15 @@ class Post < ActiveRecord::Base
         source
       end
     end
+
+    def source_domain
+      return "" unless source =~ %r!\Ahttps?://!i
+
+      url = Addressable::URI.parse(normalized_source)
+      url.domain
+    rescue
+      ""
+    end
   end
 
   module TagMethods
@@ -533,7 +526,19 @@ class Post < ActiveRecord::Base
     end
 
     def tag_array_was
-      @tag_array_was ||= Tag.scan_tags(tag_string_was)
+      @tag_array_was ||= Tag.scan_tags(tag_string_before_last_save || tag_string_was)
+    end
+
+    def tags
+      Tag.where(name: tag_array)
+    end
+
+    def tags_was
+      Tag.where(name: tag_array_was)
+    end
+
+    def added_tags
+      tags - tags_was
     end
 
     def decrement_tag_post_counts
@@ -551,48 +556,52 @@ class Post < ActiveRecord::Base
 
       increment_tags = tag_array - tag_array_was
       if increment_tags.any?
-        Tag.delay(:queue => "default").increment_post_counts(increment_tags)
+        Tag.increment_post_counts(increment_tags)
       end
       if decrement_tags.any?
-        Tag.delay(:queue => "default").decrement_post_counts(decrement_tags)
+        Tag.decrement_post_counts(decrement_tags)
       end
-      Post.expire_cache_for_all([""]) if new_record? || id <= 100_000
+
+      if PostKeeperManager.enabled? && persisted?
+        # no need to do this check on the initial create
+        PostKeeperManager.check_and_assign(self, CurrentUser.id, increment_tags)
+
+        # run this again async to check for race conditions
+        PostKeeperManager.queue_check(id, CurrentUser.id)
+      end
     end
 
-    def set_tag_counts
-      self.tag_count = 0
-      self.tag_count_general = 0
-      self.tag_count_artist = 0
-      self.tag_count_copyright = 0
-      self.tag_count_character = 0
+    def set_tag_count(category,tagcount)
+      self.send("tag_count_#{category}=",tagcount)
+    end
 
-      categories = Tag.categories_for(tag_array, :disable_caching => true)
+    def inc_tag_count(category)
+      set_tag_count(category,self.send("tag_count_#{category}") + 1)
+    end
+
+    def set_tag_counts(disable_cache = true)
+      self.tag_count = 0
+      TagCategory.categories.each {|x| set_tag_count(x,0)}
+      categories = Tag.categories_for(tag_array, :disable_caching => disable_cache)
       categories.each_value do |category|
         self.tag_count += 1
-
-        case category
-        when Tag.categories.general
-          self.tag_count_general += 1
-
-        when Tag.categories.artist
-          self.tag_count_artist += 1
-
-        when Tag.categories.copyright
-          self.tag_count_copyright += 1
-
-        when Tag.categories.character
-          self.tag_count_character += 1
-        end
+        inc_tag_count(TagCategory.reverse_mapping[category])
       end
     end
 
     def merge_old_changes
+      @removed_tags = []
+
       if old_tag_string
         # If someone else committed changes to this post before we did,
         # then try to merge the tag changes together.
         current_tags = tag_array_was()
         new_tags = tag_array()
         old_tags = Tag.scan_tags(old_tag_string)
+
+        kept_tags = current_tags & new_tags
+        @removed_tags = old_tags - kept_tags
+
         set_tag_string(((current_tags + new_tags) - old_tags + (current_tags & new_tags)).uniq.sort.join(" "))
       end
 
@@ -602,15 +611,15 @@ class Post < ActiveRecord::Base
         old_parent_id = old_parent_id.to_i
       end
       if old_parent_id == parent_id
-        self.parent_id = parent_id_was
+        self.parent_id = parent_id_before_last_save || parent_id_was
       end
 
       if old_source == source.to_s
-        self.source = source_was
+        self.source = source_before_last_save || source_was
       end
 
       if old_rating == rating
-        self.rating = rating_was
+        self.rating = rating_before_last_save || rating_was
       end
     end
 
@@ -626,30 +635,41 @@ class Post < ActiveRecord::Base
 
     def normalize_tags
       normalized_tags = Tag.scan_tags(tag_string)
+      normalized_tags = apply_casesensitive_metatags(normalized_tags)
+      normalized_tags = normalized_tags.map {|tag| tag.downcase}
       normalized_tags = filter_metatags(normalized_tags)
-      normalized_tags = normalized_tags.map{|tag| tag.downcase}
       normalized_tags = remove_negated_tags(normalized_tags)
-      normalized_tags = normalized_tags.map {|x| Tag.find_or_create_by_name(x).name}
-      normalized_tags = %w(tagme) if normalized_tags.empty?
       normalized_tags = TagAlias.to_aliased(normalized_tags)
+      normalized_tags = %w(tagme) if normalized_tags.empty?
       normalized_tags = add_automatic_tags(normalized_tags)
+      normalized_tags = remove_invalid_tags(normalized_tags)
+      normalized_tags = Tag.convert_cosplay_tags(normalized_tags)
+      normalized_tags = normalized_tags + Tag.create_for_list(TagImplication.automatic_tags_for(normalized_tags))
       normalized_tags = TagImplication.with_descendants(normalized_tags)
-      normalized_tags = normalized_tags.compact
-      normalized_tags.sort!
-      set_tag_string(normalized_tags.uniq.sort.join(" "))
+      normalized_tags = normalized_tags.compact.uniq.sort
+      normalized_tags = Tag.create_for_list(normalized_tags)
+      set_tag_string(normalized_tags.join(" "))
+    end
+
+    def remove_invalid_tags(tags)
+      invalid_tags = Tag.invalid_cosplay_tags(tags)
+      if invalid_tags.present?
+        self.warnings[:base] << "The root tag must be a character tag: #{invalid_tags.map {|tag| "[b]#{tag}[/b]" }.join(", ")}"
+      end
+      tags - invalid_tags
     end
 
     def remove_negated_tags(tags)
-      negated_tags, tags = tags.partition {|x| x =~ /\A-/i}
-      negated_tags = negated_tags.map {|x| x[1..-1]}
-      negated_tags = TagAlias.to_aliased(negated_tags)
-      return tags - negated_tags
+      @negated_tags, tags = tags.partition {|x| x =~ /\A-/i}
+      @negated_tags = @negated_tags.map {|x| x[1..-1]}
+      @negated_tags = TagAlias.to_aliased(@negated_tags)
+      return tags - @negated_tags
     end
 
     def add_automatic_tags(tags)
       return tags if !Danbooru.config.enable_dimension_autotagging
 
-      tags -= %w(incredibly_absurdres absurdres highres lowres huge_filesize animated_gif animated_png flash webm mp4)
+      tags -= %w(incredibly_absurdres absurdres highres lowres huge_filesize flash webm mp4)
 
       if has_dimensions?
         if image_width >= 10_000 || image_height >= 10_000
@@ -678,14 +698,6 @@ class Post < ActiveRecord::Base
         tags << "huge_filesize"
       end
 
-      if is_animated_gif?
-        tags << "animated_gif"
-      end
-      
-      if is_animated_png?
-        tags << "animated_png"
-      end
-
       if is_flash?
         tags << "flash"
       end
@@ -702,18 +714,51 @@ class Post < ActiveRecord::Base
         tags << "ugoira"
       end
 
-      characters = tags.grep(/\A(.+)_\(cosplay\)\Z/) { $1 }
-      tags += characters
-      tags << "cosplay" if characters.present?
+      return tags
+    end
 
+    def apply_casesensitive_metatags(tags)
+      casesensitive_metatags, tags = tags.partition {|x| x =~ /\A(?:source):/i}
+      #Reuse the following metatags after the post has been saved
+      casesensitive_metatags += tags.select {|x| x =~ /\A(?:newpool):/i}
+      if casesensitive_metatags.length > 0
+        case casesensitive_metatags[-1]
+        when /^source:none$/i
+          self.source = ""
+
+        when /^source:"(.*)"$/i
+          self.source = $1
+
+        when /^source:(.*)$/i
+          self.source = $1
+
+        when /^newpool:(.+)$/i
+          pool = Pool.find_by_name($1)
+          if pool.nil?
+            pool = Pool.create(:name => $1, :description => "This pool was automatically generated")
+          end
+        end
+      end
       return tags
     end
 
     def filter_metatags(tags)
-      @pre_metatags, tags = tags.partition {|x| x =~ /\A(?:rating|parent|-parent|source|-?locked):/i}
+      @pre_metatags, tags = tags.partition {|x| x =~ /\A(?:rating|parent|-parent|-?locked):/i}
+      tags = apply_categorization_metatags(tags)
       @post_metatags, tags = tags.partition {|x| x =~ /\A(?:-pool|pool|newpool|fav|-fav|child|-favgroup|favgroup|upvote|downvote):/i}
       apply_pre_metatags
       return tags
+    end
+
+    def apply_categorization_metatags(tags)
+      tags.map do |x|
+        if x =~ Tag.categories.regexp
+          tag = Tag.find_or_create_by_name(x)
+          tag.name
+        else
+          x
+        end
+      end
     end
 
     def apply_post_metatags
@@ -739,9 +784,6 @@ class Post < ActiveRecord::Base
 
         when /^newpool:(.+)$/i
           pool = Pool.find_by_name($1)
-          if pool.nil?
-            pool = Pool.create(:name => $1, :description => "This pool was automatically generated")
-          end
           add_pool!(pool) if pool
 
         when /^fav:(.+)$/i
@@ -760,19 +802,20 @@ class Post < ActiveRecord::Base
 
         when /^-favgroup:(\d+)$/i
           favgroup = FavoriteGroup.where("id = ?", $1.to_i).for_creator(CurrentUser.user.id).first
-          favgroup.remove!(self) if favgroup
+          favgroup.remove!(id) if favgroup
 
         when /^-favgroup:(.+)$/i
           favgroup = FavoriteGroup.named($1).for_creator(CurrentUser.user.id).first
-          favgroup.remove!(self) if favgroup
+          favgroup.remove!(id) if favgroup
 
         when /^favgroup:(\d+)$/i
           favgroup = FavoriteGroup.where("id = ?", $1.to_i).for_creator(CurrentUser.user.id).first
-          favgroup.add!(self) if favgroup
+          favgroup.add!(id) if favgroup
 
         when /^favgroup:(.+)$/i
           favgroup = FavoriteGroup.named($1).for_creator(CurrentUser.user.id).first
-          favgroup.add!(self) if favgroup
+          favgroup.add!(id) if favgroup
+
         end
       end
     end
@@ -796,26 +839,18 @@ class Post < ActiveRecord::Base
             remove_parent_loops
           end
 
-        when /^source:none$/i
-          self.source = nil
-
-        when /^source:"(.*)"$/i
-          self.source = $1
-
-        when /^source:(.*)$/i
-          self.source = $1
-
         when /^rating:([qse])/i
-          self.rating = $1.downcase
+          self.rating = $1
 
         when /^(-?)locked:notes?$/i
-          assign_attributes({ is_note_locked: $1 != "-" }, as: CurrentUser.role)
+          self.is_note_locked = ($1 != "-" ) if CurrentUser.is_builder?
 
         when /^(-?)locked:rating$/i
-          assign_attributes({ is_rating_locked: $1 != "-" }, as: CurrentUser.role)
+          self.is_rating_locked = ($1 != "-" ) if CurrentUser.is_builder?
 
         when /^(-?)locked:status$/i
-          assign_attributes({ is_status_locked: $1 != "-" }, as: CurrentUser.role)
+          self.is_status_locked = ($1 != "-" ) if CurrentUser.is_admin?
+
         end
       end
     end
@@ -832,39 +867,15 @@ class Post < ActiveRecord::Base
       set_tag_string((tag_array - Array(tag)).join(" "))
     end
 
-    def has_dup_tag?
-      has_tag?("duplicate")
-    end
-
     def tag_categories
       @tag_categories ||= Tag.categories_for(tag_array)
-    end
-
-    def copyright_tags
-      typed_tags("copyright")
-    end
-
-    def character_tags
-      typed_tags("character")
-    end
-
-    def artist_tags
-      typed_tags("artist")
-    end
-
-    def artist_tags_excluding_hidden
-      artist_tags - %w(banned_artist)
-    end
-
-    def general_tags
-      typed_tags("general")
     end
 
     def typed_tags(name)
       @typed_tags ||= {}
       @typed_tags[name] ||= begin
         tag_array.select do |tag|
-          tag_categories[tag] == Danbooru.config.tag_category_mapping[name]
+          tag_categories[tag] == TagCategory.mapping[name]
         end
       end
     end
@@ -877,51 +888,35 @@ class Post < ActiveRecord::Base
       @humanized_essential_tag_string ||= Cache.get("hets-#{id}", 1.hour.to_i) do
         string = []
 
-        if character_tags.any?
-          chartags = character_tags.slice(0, 5)
-          if character_tags.length > 5
-            chartags << "others"
+        TagCategory.humanized_list.each do |category|
+          typetags = typed_tags(category) - TagCategory.humanized_mapping[category]["exclusion"]
+          if TagCategory.humanized_mapping[category]["slice"] > 0
+            typetags = typetags.slice(0,TagCategory.humanized_mapping[category]["slice"]) + (typetags.length > TagCategory.humanized_mapping[category]["slice"] ? ["others"] : [])
           end
-          chartags = chartags.map do |tag|
-            tag.match(/^(.+?)(?:_\(.+\))?$/)[1]
+          if TagCategory.humanized_mapping[category]["regexmap"] != //
+            typetags = typetags.map do |tag|
+              tag.match(TagCategory.humanized_mapping[category]["regexmap"])[1]
+            end
           end
-          string << chartags.to_sentence
-        end
-
-        if copyright_tags.any?
-          copytags = copyright_tags.slice(0, 5)
-          if copyright_tags.length > 5
-            copytags << "others"
+          if typetags.any?
+            if category != "copyright" || typed_tags("character").any?
+              string << TagCategory.humanized_mapping[category]["formatstr"] % typetags.to_sentence
+            else
+              string << typetags.to_sentence
+            end
           end
-          copytags = copytags.to_sentence
-          string << (character_tags.any? ? "(#{copytags})" : copytags)
         end
-
-        if artist_tags_excluding_hidden.any?
-          string << "drawn by"
-          string << artist_tags_excluding_hidden.to_sentence
-        end
-
         string.empty? ? "##{id}" : string.join(" ").tr("_", " ")
       end
     end
 
-    def tag_string_copyright
-      copyright_tags.join(" ")
-    end
-
-    def tag_string_character
-      character_tags.join(" ")
-    end
-
-    def tag_string_artist
-      artist_tags.join(" ")
-    end
-
-    def tag_string_general
-      general_tags.join(" ")
+    TagCategory.categories.each do |category|
+      define_method("tag_string_#{category}") do
+        typed_tags(category).join(" ")
+      end
     end
   end
+
 
   module FavoriteMethods
     def clean_fav_string?
@@ -936,9 +931,11 @@ class Post < ActiveRecord::Base
       update_column(:fav_count, fav_count)
     end
 
-    def favorited_by?(user_id)
-      fav_string =~ /(?:\A| )fav:#{user_id}(?:\Z| )/
+    def favorited_by?(user_id = CurrentUser.id)
+      !!(fav_string =~ /(?:\A| )fav:#{user_id}(?:\Z| )/)
     end
+
+    alias_method :is_favorited?, :favorited_by?
 
     def append_user_to_fav_string(user_id)
       update_column(:fav_string, (fav_string + " fav:#{user_id}").strip)
@@ -946,8 +943,8 @@ class Post < ActiveRecord::Base
     end
 
     def add_favorite!(user)
-      Favorite.add(self, user)
-      vote!("up") if CurrentUser.is_gold?
+      Favorite.add(post: self, user: user)
+      vote!("up", user) if user.is_voter?
     rescue PostVote::Error
     end
 
@@ -956,8 +953,8 @@ class Post < ActiveRecord::Base
     end
 
     def remove_favorite!(user)
-      Favorite.remove(self, user)
-      unvote! if CurrentUser.is_gold?
+      Favorite.remove(post: self, user: user)
+      unvote!(user) if user.is_voter?
     rescue PostVote::Error
     end
 
@@ -986,10 +983,15 @@ class Post < ActiveRecord::Base
       end
     end
 
+    def remove_from_favorites
+      Favorite.where(post_id: id).delete_all
+      user_ids = fav_string.scan(/\d+/)
+      User.where(:id => user_ids).update_all("favorite_count = favorite_count - 1")
+      PostVote.where(post_id: id).delete_all
+    end
+
     def remove_from_fav_groups
-      FavoriteGroup.for_post(id).find_each do |group|
-        group.remove!(self)
-      end
+      FavoriteGroup.delay.purge_post(id)
     end
   end
 
@@ -1002,16 +1004,21 @@ class Post < ActiveRecord::Base
     end
 
     def uploader_name
-      User.id_to_name(uploader_id).tr("_", " ")
+      User.id_to_name(uploader_id)
     end
   end
 
   module PoolMethods
     def pools
       @pools ||= begin
+        return Pool.none if pool_string.blank?
         pool_ids = pool_string.scan(/\d+/)
-        Pool.where(["is_deleted = false and id in (?)", pool_ids])
+        Pool.where(id: pool_ids).series_first
       end
+    end
+
+    def has_active_pools?
+      pools.undeleted.length > 0
     end
 
     def belongs_to_pool?(pool)
@@ -1025,22 +1032,25 @@ class Post < ActiveRecord::Base
     def add_pool!(pool, force = false)
       return if belongs_to_pool?(pool)
       return if pool.is_deleted? && !force
-      reload
-      self.pool_string = "#{pool_string} pool:#{pool.id}".strip
-      set_pool_category_pseudo_tags
-      update_column(:pool_string, pool_string) unless new_record?
-      pool.add!(self)
+
+      with_lock do
+        self.pool_string = "#{pool_string} pool:#{pool.id}".strip
+        set_pool_category_pseudo_tags
+        update_column(:pool_string, pool_string) unless new_record?
+        pool.add!(self)
+      end
     end
 
-    def remove_pool!(pool, force = false)
+    def remove_pool!(pool)
       return unless belongs_to_pool?(pool)
       return unless CurrentUser.user.can_remove_from_pools?
-      return if pool.is_deleted? && !force
-      reload
-      self.pool_string = pool_string.gsub(/(?:\A| )pool:#{pool.id}(?:\Z| )/, " ").strip
-      set_pool_category_pseudo_tags
-      update_column(:pool_string, pool_string) unless new_record?
-      pool.remove!(self)
+
+      with_lock do
+        self.pool_string = pool_string.gsub(/(?:\A| )pool:#{pool.id}(?:\Z| )/, " ").strip
+        set_pool_category_pseudo_tags
+        update_column(:pool_string, pool_string) unless new_record?
+        pool.remove!(self)
+      end
     end
 
     def remove_from_all_pools
@@ -1052,7 +1062,7 @@ class Post < ActiveRecord::Base
     def set_pool_category_pseudo_tags
       self.pool_string = (pool_string.scan(/\S+/) - ["pool:series", "pool:collection"]).join(" ")
 
-      pool_categories = pools.select("category").map(&:category)
+      pool_categories = pools.undeleted.pluck(:category)
       if pool_categories.include?("series")
         self.pool_string = "#{pool_string} pool:series".strip
       end
@@ -1067,79 +1077,35 @@ class Post < ActiveRecord::Base
       !PostVote.exists?(:user_id => user.id, :post_id => id)
     end
 
-    def vote!(score)
-      unless CurrentUser.is_voter?
+    def vote!(vote, voter = CurrentUser.user)
+      unless voter.is_voter?
         raise PostVote::Error.new("You do not have permission to vote")
       end
 
-      unless can_be_voted_by?(CurrentUser.user)
+      unless can_be_voted_by?(voter)
         raise PostVote::Error.new("You have already voted for this post")
       end
 
-      PostVote.create!(:post_id => id, :score => score)
+      votes.create!(user: voter, vote: vote)
       reload # PostVote.create modifies our score. Reload to get the new score.
     end
 
-    def unvote!
-      if can_be_voted_by?(CurrentUser.user)
+    def unvote!(voter = CurrentUser.user)
+      if can_be_voted_by?(voter)
         raise PostVote::Error.new("You have not voted for this post")
       else
-        vote = PostVote.where("post_id = ? and user_id = ?", id, CurrentUser.user.id).first
-        vote.destroy
-
-        self.reload
+        votes.where(user: voter).destroy_all
+        reload
       end
     end
   end
 
   module CountMethods
-    def fix_post_counts
-      post.set_tag_counts
-      post.update_columns(
-        :tag_count => post.tag_count,
-        :tag_count_general => post.tag_count_general,
-        :tag_count_artist => post.tag_count_artist,
-        :tag_count_copyright => post.tag_count_copyright,
-        :tag_count_character => post.tag_count_character
-      )
-    end
-
-    def get_count_from_cache(tags)
-      count = Cache.get(count_cache_key(tags))
-
-      if count.nil? && !CurrentUser.safe_mode? && !CurrentUser.hide_deleted_posts?
-        count = select_value_sql("SELECT post_count FROM tags WHERE name = ?", tags.to_s)
-      end
-
-      count
-    end
-
-    def set_count_in_cache(tags, count, expiry = nil)
-      if expiry.nil?
-        if count < 100
-          expiry = 1.minute
-        else
-          expiry = (count * 4).minutes
-        end
-      end
-
-      Cache.put(count_cache_key(tags), count, expiry)
-    end
-
-    def count_cache_key(tags)
-      if CurrentUser.safe_mode?
-        tags = "#{tags} rating:s".strip
-      end
-      
-      if CurrentUser.user && CurrentUser.hide_deleted_posts? && tags !~ /(?:^|\s)(?:-)?status:.+/
-        tags = "#{tags} -status:deleted".strip
-      end
-
-      "pfc:#{Cache.sanitize(tags)}"
-    end
-
     def fast_count(tags = "", options = {})
-      tags = tags.to_s.strip
+      tags = tags.to_s
+      tags += " rating:s" if CurrentUser.safe_mode?
+      tags += " -status:deleted" if CurrentUser.hide_deleted_posts? && tags !~ /(?:^|\s)(?:-)?status:.+/
+      tags = Tag.normalize_query(tags)
 
       # optimize some cases. these are just estimates but at these
       # quantities being off by a few hundred doesn't matter much
@@ -1164,11 +1130,11 @@ class Post < ActiveRecord::Base
 
       count = get_count_from_cache(tags)
 
-      if count.to_i == 0
+      if count.nil?
         count = fast_count_search(tags, options)
       end
 
-      count.to_i
+      count
     rescue SearchError
       0
     end
@@ -1178,17 +1144,20 @@ class Post < ActiveRecord::Base
         PostReadOnly.tag_match(tags).count
       end
 
-      if count == nil && tags !~ / /
+      if count.nil?
         count = fast_count_search_batched(tags, options)
       end
 
-      if count
-        set_count_in_cache(tags, count)
-      else
+      if count.nil?
+        # give up
         count = Danbooru.config.blank_tag_search_fast_count
+      else
+        set_count_in_cache(tags, count)
       end
 
-      count
+      count ? count.to_i : nil
+    rescue PG::ConnectionBad
+      return nil
     end
 
     def fast_count_search_batched(tags, options)
@@ -1206,20 +1175,40 @@ class Post < ActiveRecord::Base
         end
       end
       sum
-    end
-  end
 
-  module CacheMethods
-    def expire_cache_for_all(tag_names)
-      Danbooru.config.all_server_hosts.each do |host|
-        delay(:queue => host).expire_cache(tag_names)
+    rescue PG::ConnectionBad
+      return nil
+    end
+
+    def fix_post_counts(post)
+      post.set_tag_counts(false)
+      if post.changes_saved?
+        args = Hash[TagCategory.categories.map {|x| ["tag_count_#{x}",post.send("tag_count_#{x}")]}].update(:tag_count => post.tag_count)
+        post.update_columns(args)
       end
     end
 
-    def expire_cache(tag_names)
-      tag_names.each do |tag_name|
-        Cache.delete(Post.count_cache_key(tag_name))
+    def get_count_from_cache(tags)
+      if Tag.is_simple_tag?(tags)
+        count = select_value_sql("SELECT post_count FROM tags WHERE name = ?", tags.to_s)
+      else
+        # this will only have a value for multi-tag searches or single metatag searches
+        count = Cache.get(count_cache_key(tags))
       end
+
+      count.try(:to_i)
+    end
+
+    def set_count_in_cache(tags, count, expiry = nil)
+      if expiry.nil?
+        [count.seconds, 20.hours].min
+      end
+
+      Cache.put(count_cache_key(tags), count, expiry)
+    end
+
+    def count_cache_key(tags)
+      "pfc:#{Cache.hash(tags)}"
     end
   end
 
@@ -1237,17 +1226,8 @@ class Post < ActiveRecord::Base
     # - Move favorites to the first child.
     # - Reparent all children to the first child.
 
-    module ClassMethods
-      def update_has_children_flag_for(post_id)
-        return if post_id.nil?
-        has_children = Post.where("parent_id = ?", post_id).exists?
-        has_active_children = Post.where("parent_id = ? and is_deleted = ?", post_id, false).exists?
-        execute_sql("UPDATE posts SET has_children = ?, has_active_children = ? WHERE id = ?", has_children, has_active_children, post_id)
-      end
-    end
-
-    def self.included(m)
-      m.extend(ClassMethods)
+    def update_has_children_flag
+      update(has_children: children.exists?, has_active_children: children.undeleted.exists?)
     end
 
     def blank_out_nonexistent_parents
@@ -1263,48 +1243,40 @@ class Post < ActiveRecord::Base
       end
     end
 
-    def validate_parent_does_not_have_a_parent
-      return if parent.nil?
-      if !parent.parent.nil?
-        errors.add(:parent, "can not have a parent")
-      end
-    end
-
     def update_parent_on_destroy
-      Post.update_has_children_flag_for(parent_id) if parent_id
+      parent.update_has_children_flag if parent
     end
 
     def update_children_on_destroy
-      if children.size == 0
-        # do nothing
-      elsif children.size == 1
-        children.first.update_column(:parent_id, nil)
-      else
-        cached_children = children
-        eldest = cached_children[0]
-        siblings = cached_children[1..-1]
-        eldest.update_column(:parent_id, nil)
-        Post.where(:id => siblings.map(&:id)).update_all(:parent_id => eldest.id)
-      end
+      return unless children.present?
+
+      eldest = children[0]
+      siblings = children[1..-1]
+
+      eldest.update(parent_id: nil)
+      Post.where(id: siblings).find_each { |p| p.update(parent_id: eldest.id) }
+      # Post.where(id: siblings).update(parent_id: eldest.id) # XXX rails 5
     end
 
     def update_parent_on_save
-      if parent_id == parent_id_was
-        Post.update_has_children_flag_for(parent_id)
-      elsif !parent_id_was.nil?
-        Post.update_has_children_flag_for(parent_id)
-        Post.update_has_children_flag_for(parent_id_was)
-      else
-        Post.update_has_children_flag_for(parent_id)
-      end
+      return unless saved_change_to_parent_id? || saved_change_to_is_deleted?
+
+      parent.update_has_children_flag if parent.present?
+      Post.find(parent_id_before_last_save).update_has_children_flag if parent_id_before_last_save.present?
     end
 
-    def give_favorites_to_parent
+    def give_favorites_to_parent(options = {})
       return if parent.nil?
 
-      favorited_users.each do |user|
-        remove_favorite!(user)
-        parent.add_favorite!(user)
+      transaction do
+        favorites.each do |fav|
+          remove_favorite!(fav.user)
+          parent.add_favorite!(fav.user)
+        end
+      end
+
+      unless options[:without_mod_action]
+        ModAction.log("moved favorites from post ##{id} to post ##{parent.id}",:post_move_favorites)
       end
     end
 
@@ -1337,55 +1309,53 @@ class Post < ActiveRecord::Base
         return false
       end
 
-      ModAction.log("permanently deleted post ##{id}")
-      delete!(:without_mod_action => true)
-      Post.without_timeout do
-        give_favorites_to_parent
-        update_children_on_destroy
-        decrement_tag_post_counts
-        remove_from_all_pools
-        remove_from_fav_groups
-        destroy
-        update_parent_on_destroy
+      transaction do
+        Post.without_timeout do
+          ModAction.log("permanently deleted post ##{id}",:post_permanent_delete)
+
+          give_favorites_to_parent
+          update_children_on_destroy
+          decrement_tag_post_counts
+          remove_from_all_pools
+          remove_from_fav_groups
+          remove_from_favorites
+          destroy
+          update_parent_on_destroy
+        end
       end
     end
 
     def ban!
       update_column(:is_banned, true)
-      ModAction.log("banned post ##{id}")
+      ModAction.log("banned post ##{id}",:post_ban)
     end
 
     def unban!
       update_column(:is_banned, false)
-      ModAction.log("unbanned post ##{id}")
+      ModAction.log("unbanned post ##{id}",:post_unban)
     end
 
-    def delete!(options = {})
+    def delete!(reason, options = {})
       if is_status_locked?
         self.errors.add(:is_status_locked, "; cannot delete post")
         return false
       end
 
       Post.transaction do
-        self.is_deleted = true
-        self.is_pending = false
-        self.is_flagged = false
-        self.is_banned = true if options[:ban] || has_tag?("banned_artist")
-        update_columns(
-          :is_deleted => is_deleted,
-          :is_pending => is_pending,
-          :is_flagged => is_flagged,
-          :is_banned => is_banned
+        flag!(reason, is_deletion: true)
+
+        update(
+          is_deleted: true,
+          is_pending: false,
+          is_flagged: false,
+          is_banned: is_banned || options[:ban] || has_tag?("banned_artist")
         )
-        give_favorites_to_parent if options[:move_favorites]
-        update_parent_on_save
+
+        # XXX This must happen *after* the `is_deleted` flag is set to true (issue #3419).
+        give_favorites_to_parent(options) if options[:move_favorites]
 
         unless options[:without_mod_action]
-          if options[:reason]
-            ModAction.log("deleted post ##{id}, reason: #{options[:reason]}")
-          else
-            ModAction.log("deleted post ##{id}")
-          end
+          ModAction.log("deleted post ##{id}, reason: #{reason}",:post_delete)
         end
       end
     end
@@ -1397,7 +1367,7 @@ class Post < ActiveRecord::Base
       end
 
       if !CurrentUser.is_admin? 
-        if approver_id == CurrentUser.id || PostApproval.approved?(CurrentUser.id, id)
+        if approved_by?(CurrentUser.user)
           raise ApprovalError.new("You have previously approved this post and cannot undelete it")
         elsif uploader_id == CurrentUser.id
           raise ApprovalError.new("You cannot undelete a post you uploaded")
@@ -1408,20 +1378,27 @@ class Post < ActiveRecord::Base
       self.approver_id = CurrentUser.id
       flags.each {|x| x.resolve!}
       save
-      Post.expire_cache_for_all(tag_array)
-      ModAction.log("undeleted post ##{id}")
+      ModAction.log("undeleted post ##{id}",:post_undelete)
+    end
+
+    def replace!(params)
+      transaction do
+        replacement = replacements.create(params)
+        replacement.process!
+        replacement
+      end
     end
   end
 
   module VersionMethods
     def create_version(force = false)
-      if new_record? || rating_changed? || source_changed? || parent_id_changed? || tag_string_changed? || force
-        if merge_version?
-          delete_previous_version
-        end
-
+      if new_record? || saved_change_to_watched_attributes? || force
         create_new_version
       end
+    end
+
+    def saved_change_to_watched_attributes?
+      saved_change_to_rating? || saved_change_to_source? || saved_change_to_parent_id? || saved_change_to_tag_string?
     end
 
     def merge_version?
@@ -1431,19 +1408,7 @@ class Post < ActiveRecord::Base
 
     def create_new_version
       User.where(id: CurrentUser.id).update_all("post_update_count = post_update_count + 1")
-      CurrentUser.reload
-
-      versions.create(
-        :rating => rating,
-        :source => source,
-        :tags => tag_string,
-        :parent_id => parent_id
-      )
-    end
-
-    def delete_previous_version
-      prev = versions.last
-      prev.destroy
+      PostArchive.queue(self) if PostArchive.enabled?
     end
 
     def revert_to(target)
@@ -1465,7 +1430,7 @@ class Post < ActiveRecord::Base
     def notify_pubsub
       return unless Danbooru.config.google_api_project
 
-      PostUpdate.insert(id)
+      # PostUpdate.insert(id)
     end
   end
 
@@ -1474,36 +1439,49 @@ class Post < ActiveRecord::Base
       last_noted_at.present?
     end
 
-    def copy_notes_to(other_post)
-      if id == other_post.id
-        errors.add :base, "Source and destination posts are the same"
-        return false
-      end
-      unless has_notes?
-        errors.add :post, "has no notes"
-        return false
-      end
+    def copy_notes_to(other_post, copy_tags: NOTE_COPY_TAGS)
+      transaction do
+        if id == other_post.id
+          errors.add :base, "Source and destination posts are the same"
+          return false
+        end
+        unless has_notes?
+          errors.add :post, "has no notes"
+          return false
+        end
 
-      notes.active.each do |note|
-        note.copy_to(other_post)
-      end
+        notes.active.each do |note|
+          note.copy_to(other_post)
+        end
 
-      dummy = Note.new
-      if notes.active.length == 1
-        dummy.body = "Copied 1 note from post ##{id}."
-      else
-        dummy.body = "Copied #{notes.active.length} notes from post ##{id}."
+        dummy = Note.new
+        if notes.active.length == 1
+          dummy.body = "Copied 1 note from post ##{id}."
+        else
+          dummy.body = "Copied #{notes.active.length} notes from post ##{id}."
+        end
+        dummy.is_active = false
+        dummy.post_id = other_post.id
+        dummy.x = dummy.y = dummy.width = dummy.height = 0
+        dummy.save
+
+        copy_tags.each do |tag|
+          other_post.remove_tag(tag)
+          other_post.add_tag(tag) if has_tag?(tag)
+        end
+
+        other_post.has_embedded_notes = has_embedded_notes
+        other_post.save
       end
-      dummy.is_active = false
-      dummy.post_id = other_post.id
-      dummy.x = dummy.y = dummy.width = dummy.height = 0
-      dummy.save
     end
   end
 
   module ApiMethods
     def hidden_attributes
       list = super + [:tag_index]
+      unless CurrentUser.is_moderator?
+        list += [:fav_string]
+      end
       if !visible?
         list += [:md5, :file_ext]
       end
@@ -1511,7 +1489,7 @@ class Post < ActiveRecord::Base
     end
 
     def method_attributes
-      list = super + [:uploader_name, :has_large, :tag_string_artist, :tag_string_character, :tag_string_copyright, :tag_string_general, :has_visible_children, :children_ids]
+      list = super + [:uploader_name, :has_large, :has_visible_children, :children_ids, :is_favorited?] + TagCategory.categories.map {|x| "tag_string_#{x}".to_sym}
       if visible?
         list += [:file_url, :large_file_url, :preview_file_url]
       end
@@ -1529,7 +1507,7 @@ class Post < ActiveRecord::Base
       super(options)
     end
 
-    def to_legacy_json
+    def legacy_attributes
       hash = {
         "has_comments" => last_commented_at.present?,
         "parent_id" => parent_id,
@@ -1555,7 +1533,7 @@ class Post < ActiveRecord::Base
         hash["md5"] = md5
       end
 
-      hash.to_json
+      hash
     end
 
     def status
@@ -1586,6 +1564,17 @@ class Post < ActiveRecord::Base
       where("md5 >= ?", key).reorder("md5 asc").first
     end
 
+    def sample(query, sample_size)
+      CurrentUser.without_safe_mode do
+        tag_match(query).reorder(:md5).limit(sample_size)
+      end
+    end
+
+    # unflattens the tag_string into one tag per row.
+    def with_unflattened_tags
+      joins("CROSS JOIN unnest(string_to_array(tag_string, ' ')) AS tag")
+    end
+
     def pending
       where("is_pending = ?", true)
     end
@@ -1614,11 +1603,14 @@ class Post < ActiveRecord::Base
       where("uploader_id = ?", user_id)
     end
 
-    def available_for_moderation(hidden)
+    def available_for_moderation(hidden, user = CurrentUser.user)
+      approved_posts = user.post_approvals.select(:post_id)
+      disapproved_posts = user.post_disapprovals.select(:post_id)
+
       if hidden.present?
-        where("posts.id IN (SELECT pd.post_id FROM post_disapprovals pd WHERE pd.user_id = ?)", CurrentUser.id)
+        where("posts.uploader_id = ? OR posts.id IN (#{approved_posts.to_sql}) OR posts.id IN (#{disapproved_posts.to_sql})", user.id)
       else
-        where("posts.id NOT IN (SELECT pd.post_id FROM post_disapprovals pd WHERE pd.user_id = ?)", CurrentUser.id)
+        where.not(uploader: user).where.not(id: approved_posts).where.not(id: disapproved_posts)
       end
     end
 
@@ -1633,7 +1625,11 @@ class Post < ActiveRecord::Base
       end
 
       if read_only
-        PostQueryBuilder.new(query).build(PostReadOnly.where("true"))
+        begin
+          PostQueryBuilder.new(query).build(PostReadOnly.where("true"))
+        rescue PG::ConnectionBad
+          PostQueryBuilder.new(query).build
+        end
       else
         PostQueryBuilder.new(query).build
       end
@@ -1666,21 +1662,13 @@ class Post < ActiveRecord::Base
     end
 
     def update_iqdb_async
-      if File.exists?(preview_file_path) && Post.iqdb_enabled?
-        Post.iqdb_sqs_service.send_message("update\n#{id}\n#{complete_preview_file_url}")
+      if Post.iqdb_enabled? && has_preview?
+        Post.iqdb_sqs_service.send_message("update\n#{id}\n#{preview_file_url}")
       end
     end
 
     def remove_iqdb_async
-      if File.exists?(preview_file_path) && Post.iqdb_enabled?
-        Post.iqdb_sqs_service.send_message("remove\n#{id}")
-      end
-    end
-
-    def update_iqdb
-      if Post.iqdb_enabled? && Post.iqdb_enabled?
-        Post.iqdb_sqs_service.send_message("update\n#{id}\n#{complete_preview_file_url}")
-      end
+      Post.remove_iqdb(id)
     end
   end
 
@@ -1716,6 +1704,68 @@ class Post < ActiveRecord::Base
         end
       end
     end
+
+    def added_tags_are_valid
+      new_tags = added_tags.select { |t| t.post_count <= 0 }
+      new_general_tags = new_tags.select { |t| t.category == Tag.categories.general }
+      new_artist_tags = new_tags.select { |t| t.category == Tag.categories.artist }
+      repopulated_tags = new_tags.select { |t| (t.category != Tag.categories.general) && (t.category != Tag.categories.meta) && (t.created_at < 1.hour.ago) }
+
+      if new_general_tags.present?
+        n = new_general_tags.size
+        tag_wiki_links = new_general_tags.map { |tag| "[[#{tag.name}]]" }
+        self.warnings[:base] << "Created #{n} new #{n == 1 ? "tag" : "tags"}: #{tag_wiki_links.join(", ")}"
+      end
+
+      if repopulated_tags.present?
+        n = repopulated_tags.size
+        tag_wiki_links = repopulated_tags.map { |tag| "[[#{tag.name}]]" }
+        self.warnings[:base] << "Repopulated #{n} old #{n == 1 ? "tag" : "tags"}: #{tag_wiki_links.join(", ")}"
+      end
+
+      new_artist_tags.each do |tag|
+        if tag.artist.blank?
+          self.warnings[:base] << "Artist [[#{tag.name}]] requires an artist entry. \"Create new artist entry\":[/artists/new?artist%5Bname%5D=#{CGI::escape(tag.name)}]"
+        end
+      end
+    end
+
+    def removed_tags_are_valid
+      attempted_removed_tags = @removed_tags + @negated_tags
+      unremoved_tags = tag_array & attempted_removed_tags
+
+      if unremoved_tags.present?
+        unremoved_tags_list = unremoved_tags.map { |t| "[[#{t}]]" }.to_sentence
+        self.warnings[:base] << "#{unremoved_tags_list} could not be removed. Check for implications and try again"
+      end
+    end
+
+    def has_artist_tag
+      return if !new_record?
+      return if source !~ %r!\Ahttps?://!
+      return if has_tag?("artist_request") || has_tag?("official_art")
+      return if tags.any? { |t| t.category == Tag.categories.artist }
+
+      site = Sources::Site.new(source)
+      self.warnings[:base] << "Artist tag is required. Create a new tag with [[artist:<artist_name>]]. Ask on the forum if you need naming help"
+    rescue Sources::Site::NoStrategyError => e
+      # unrecognized source; do nothing.
+    end
+
+    def has_copyright_tag
+      return if !new_record?
+      return if has_tag?("copyright_request") || tags.any? { |t| t.category == Tag.categories.copyright }
+
+      self.warnings[:base] << "Copyright tag is required. Consider adding [[copyright request]] or [[original]]"
+    end
+
+    def has_enough_tags
+      return if !new_record?
+
+      if tags.count { |t| t.category == Tag.categories.general } < 10
+        self.warnings[:base] << "Uploads must have at least 10 general tags. Read [[howto:tag]] for guidelines on tagging your uploads"
+      end
+    end
   end
   
   include FileMethods
@@ -1728,7 +1778,6 @@ class Post < ActiveRecord::Base
   include PoolMethods
   include VoteMethods
   extend CountMethods
-  extend CacheMethods
   include ParentMethods
   include DeletionMethods
   include VersionMethods
@@ -1742,15 +1791,26 @@ class Post < ActiveRecord::Base
 
   BOOLEAN_ATTRIBUTES = %w(
     has_embedded_notes
-    cdn_hosted
+    has_cropped
   )
   has_bit_flags BOOLEAN_ATTRIBUTES
 
+  def safeblocked?
+    CurrentUser.safe_mode? && (rating != "s" || has_tag?("toddlercon|toddler|diaper|tentacle|rape|bestiality|beastiality|lolita|loli|nude|shota|pussy|penis"))
+  end
+
+  def levelblocked?
+    !Danbooru.config.can_user_see_post?(CurrentUser.user, self)
+  end
+
+  def banblocked?
+    is_banned? && !CurrentUser.is_gold?
+  end
+
   def visible?
-    return false if !Danbooru.config.can_user_see_post?(CurrentUser.user, self)
-    return false if CurrentUser.safe_mode? && rating != "s"
-    return false if CurrentUser.safe_mode? && has_tag?("toddlercon|toddler|diaper|tentacle|rape|bestiality|beastiality|lolita|loli|nude|shota|pussy|penis")
-    return false if is_banned? && !CurrentUser.is_gold?
+    return false if safeblocked?
+    return false if levelblocked?
+    return false if banblocked?
     return true
   end
 
@@ -1769,28 +1829,20 @@ class Post < ActiveRecord::Base
   end
 
   def mark_as_translated(params)
-    tags = self.tag_array.dup
+    add_tag("check_translation") if params["check_translation"].to_s.truthy?
+    remove_tag("check_translation") if params["check_translation"].to_s.falsy?
 
-    if params["check_translation"] == "1"
-      tags << "check_translation"
-    elsif params["check_translation"] == "0"
-      tags -= ["check_translation"]
-    end
-    if params["partially_translated"] == "1"
-      tags << "partially_translated"
-    elsif params["partially_translated"] == "0"
-      tags -= ["partially_translated"]
-    end
+    add_tag("partially_translated") if params["partially_translated"].to_s.truthy?
+    remove_tag("partially_translated") if params["partially_translated"].to_s.falsy?
 
-    if params["check_translation"] == "1" || params["partially_translated"] == "1"
-      tags << "translation_request"
-      tags -= ["translated"]
+    if has_tag?("check_translation") || has_tag?("partially_translated")
+      add_tag("translation_request")
+      remove_tag("translated")
     else
-      tags << "translated"
-      tags -= ["translation_request"]
+      add_tag("translated")
+      remove_tag("translation_request")
     end
 
-    self.tag_string = tags.join(" ")
     save
   end
 
@@ -1806,5 +1858,3 @@ class Post < ActiveRecord::Base
     ret
   end
 end
-
-Post.connection.extend(PostgresExtensions)

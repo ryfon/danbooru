@@ -1,6 +1,9 @@
 <div id="c-mod-actions">
   <div id="a-index">
     <h1>Mod Actions</h1>
+
+    <%= render "search" %>
+
     <table class="striped" width="100%">
       <thead>
         <tr>
@@ -14,7 +17,7 @@
           <tr>
             <td><%= compact_time mod_action.created_at %></td>
             <td><%= link_to_user mod_action.creator %></td>
-            <td><%= format_text(mod_action.description, :ragel => true) %></td>
+            <td><%= format_text(mod_action.description) %></td>
           </tr>
         <% end %>
       </tbody>

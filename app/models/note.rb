@@ -1,21 +1,19 @@
-class Note < ActiveRecord::Base
+class Note < ApplicationRecord
   class RevertError < Exception ; end
 
-  attr_accessor :updater_id, :updater_ip_addr, :html_id
+  attribute :updater_id, :integer
+  attribute :updater_ip_addr, :inet
+  attr_accessor :html_id
   belongs_to :post
-  belongs_to :creator, :class_name => "User"
-  belongs_to :updater, :class_name => "User"
-  has_many :versions, lambda {order("note_versions.id ASC")}, :class_name => "NoteVersion", :dependent => :destroy
-  before_validation :initialize_creator, :on => :create
-  before_validation :initialize_updater
-  before_validation :blank_body
-  validates_presence_of :post_id, :creator_id, :updater_id, :x, :y, :width, :height
+  belongs_to_creator
+  belongs_to_updater
+  has_many :versions, -> {order("note_versions.id ASC")}, :class_name => "NoteVersion", :dependent => :destroy
+  validates_presence_of :post_id, :creator_id, :updater_id, :x, :y, :width, :height, :body
   validate :post_must_exist
   validate :note_within_image
   after_save :update_post
   after_save :create_version
   validate :post_must_not_be_note_locked
-  attr_accessible :x, :y, :width, :height, :body, :updater_id, :updater_ip_addr, :is_active, :post_id, :post, :html_id
 
   module SearchMethods
     def active
@@ -43,21 +41,16 @@ class Note < ActiveRecord::Base
     end
 
     def search(params)
-      q = where("true")
-      return q if params.blank?
+      q = super
 
       if params[:body_matches].present?
         q = q.body_matches(params[:body_matches])
       end
 
-      if params[:is_active] == "true"
-        q = q.active
-      elsif params[:is_active] == "false"
-        q = q.where("is_active = false")
-      end
+      q = q.attribute_matches(:is_active, params[:is_active])
 
       if params[:post_id].present?
-        q = q.where("post_id = ?", params[:post_id].to_i)
+        q = q.where(post_id: params[:post_id].split(",").map(&:to_i))
       end
 
       if params[:post_tags_match].present?
@@ -69,10 +62,10 @@ class Note < ActiveRecord::Base
       end
 
       if params[:creator_id].present?
-        q = q.where("creator_id = ?", params[:creator_id].to_i)
+        q = q.where(creator_id: params[:creator_id].split(",").map(&:to_i))
       end
 
-      q
+      q.apply_default_order(params)
     end
   end
 
@@ -88,15 +81,6 @@ class Note < ActiveRecord::Base
 
   extend SearchMethods
   include ApiMethods
-
-  def initialize_creator
-    self.creator_id ||= CurrentUser.id
-  end
-
-  def initialize_updater
-    self.updater_id = CurrentUser.id
-    self.updater_ip_addr = CurrentUser.ip_addr
-  end
 
   def post_must_exist
     if !Post.exists?(post_id)
@@ -124,16 +108,16 @@ class Note < ActiveRecord::Base
     Post.exists?(["id = ? AND is_note_locked = ?", post_id, true])
   end
 
-  def blank_body
-    self.body = "(empty)" if body.blank?
-  end
-
-  def creator_name
-    User.id_to_name(creator_id).tr("_", " ")
+  def rescale!(x_scale, y_scale)
+    self.x *= x_scale
+    self.y *= y_scale
+    self.width *= x_scale
+    self.height *= y_scale
+    save!
   end
 
   def update_post
-    if self.changed?
+    if self.saved_changes?
       if Note.where(:is_active => true, :post_id => post_id).exists?
         execute_sql("UPDATE posts SET last_noted_at = ? WHERE id = ?", updated_at, post_id)
       else
@@ -143,8 +127,7 @@ class Note < ActiveRecord::Base
   end
 
   def create_version
-    User.where(id: CurrentUser.id).update_all("note_update_count = note_update_count + 1")
-    CurrentUser.reload
+    return unless saved_change_to_versioned_attributes?
 
     if merge_version?
       merge_version
@@ -153,6 +136,10 @@ class Note < ActiveRecord::Base
       reload
       create_new_version
     end
+  end
+
+  def saved_change_to_versioned_attributes?
+    new_record? || saved_change_to_x? || saved_change_to_y? || saved_change_to_width? || saved_change_to_height? || saved_change_to_is_active? || saved_change_to_body?
   end
 
   def create_new_version
@@ -184,7 +171,7 @@ class Note < ActiveRecord::Base
 
   def merge_version?
     prev = versions.last
-    prev && prev.updater_id == CurrentUser.user.id && prev.updated_at > 1.hour.ago && !is_active_changed?
+    prev && prev.updater_id == CurrentUser.user.id && prev.updated_at > 1.hour.ago && !saved_change_to_is_active?
   end
 
   def revert_to(version)

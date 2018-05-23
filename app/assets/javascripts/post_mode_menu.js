@@ -138,7 +138,13 @@
     var $post = $("#post_" + post_id);
     $("#quick-edit-div").slideDown("fast");
     $("#quick-edit-form").attr("action", "/posts/" + post_id + ".json");
-    $("#post_tag_string").val($post.data("tags") + " ").focus().selectEnd().height($("#post_tag_string")[0].scrollHeight);
+    $("#post_tag_string").val($post.data("tags") + " ").focus().selectEnd();
+
+    /* Set height of tag edit box to fit content. */
+    $("#post_tag_string").height(80);  // min height: 80px.
+    var padding = $("#post_tag_string").innerHeight() - $("#post_tag_string").height();
+    var height = $("#post_tag_string").prop("scrollHeight") - padding;
+    $("#post_tag_string").height(height);
   }
 
   Danbooru.PostModeMenu.click = function(e) {
@@ -155,12 +161,6 @@
       Danbooru.Post.vote("down", post_id);
     } else if (s === 'vote-up') {
       Danbooru.Post.vote("up", post_id);
-    } else if (s === 'rating-q') {
-      Danbooru.Post.update(post_id, {"post[rating]": "q"});
-    } else if (s === 'rating-s') {
-      Danbooru.Post.update(post_id, {"post[rating]": "s"});
-    } else if (s === 'rating-e') {
-      Danbooru.Post.update(post_id, {"post[rating]": "e"});
     } else if (s === 'lock-rating') {
       Danbooru.Post.update(post_id, {"post[is_rating_locked]": "1"});
     } else if (s === 'lock-note') {

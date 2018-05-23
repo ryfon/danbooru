@@ -1,9 +1,27 @@
+require 'resolv-replace'
+
 class PixivApiClient
   API_VERSION = "1"
   CLIENT_ID = "bYGKuGVw91e0NMfPGp44euvGt59s"
   CLIENT_SECRET = "HP3RmkgAmEGro0gn1x9ioawQE8WMfvLXDz3ZqxpK"
 
+  # Tools to not include in the tags list. We don't tag digital media, so
+  # including these results in bad translated tags suggestions.
+  TOOLS_BLACKLIST = %w[
+    Photoshop Illustrator Fireworks Flash Painter PaintShopPro pixiv\ Sketch
+    CLIP\ STUDIO\ PAINT IllustStudio ComicStudio RETAS\ STUDIO SAI PhotoStudio
+    Pixia NekoPaint PictBear openCanvas ArtRage Expression Inkscape GIMP
+    CGillust COMICWORKS MS_Paint EDGE AzPainter AzPainter2 AzDrawing
+    PicturePublisher SketchBookPro Processing 4thPaint GraphicsGale mdiapp
+    Paintgraphic AfterEffects drawr CLIP\ PAINT\ Lab FireAlpaca Pixelmator
+    AzDrawing2 MediBang\ Paint Krita ibisPaint Procreate Live2D
+    Lightwave3D Shade Poser STRATA AnimationMaster XSI CARRARA CINEMA4D Maya
+    3dsMax Blender ZBrush Metasequoia Sunny3D Bryce Vue Hexagon\ King SketchUp
+    VistaPro Sculptris Comi\ Po! modo DAZ\ Studio 3D-Coat
+  ]
+
   class Error < Exception ; end
+  class BadIDError < Error ; end
 
   class WorksResponse
     attr_reader :json, :pages, :name, :moniker, :user_id, :page_count, :tags
@@ -94,54 +112,50 @@ class PixivApiClient
       @user_id = json["user"]["id"]
       @moniker = json["user"]["account"]
       @page_count = json["page_count"].to_i
-      @artist_commentary_title = json["title"]
-      @artist_commentary_desc = json["caption"]
-      @tags = json["tags"]
+      @artist_commentary_title = json["title"].to_s
+      @artist_commentary_desc = json["caption"].to_s
+      @tags = json["tags"].reject {|x| x =~ /^http:/}
+      @tags += json["tools"] - TOOLS_BLACKLIST
 
-      if page_count > 1
-        @pages = json["metadata"]["pages"].map {|x| x["image_urls"]["large"]}
-      else
+      if json["metadata"]
+        if json["metadata"]["zip_urls"]
+          @pages = json["metadata"]["zip_urls"]
+        elsif page_count > 1
+          @pages = json["metadata"]["pages"].map {|x| x["image_urls"]["large"]}
+        end
+      end
+
+      if @pages.nil? && json["image_urls"]
         @pages = [json["image_urls"]["large"]]
       end
     end
   end
 
   def works(illust_id)
-    headers = {
+    headers = Danbooru.config.http_headers.merge(
       "Referer" => "http://www.pixiv.net",
-      "User-Agent" => "#{Danbooru.config.safe_app_name}/#{Danbooru.config.version}",
       "Content-Type" => "application/x-www-form-urlencoded",
       "Authorization" => "Bearer #{access_token}"
-    }
+    )
     params = {
       "image_sizes" => "large",
       "include_stats" => "true"
     }
-    url = URI.parse("https://public-api.secure.pixiv.net/v#{API_VERSION}/works/#{illust_id.to_i}.json")
-    url.query = URI.encode_www_form(params)
-    json = nil
 
-    Net::HTTP.start(url.host, url.port, :use_ssl => true) do |http|
-      resp = http.request_get(url.request_uri, headers)
-      if resp.is_a?(Net::HTTPSuccess)
-        json = parse_api_json(resp.body)
-      else
-        raise Error.new("Pixiv API call failed (status=#{resp.code} body=#{resp.body})")
-      end
-    end
-
-    WorksResponse.new(json["response"][0])
-  end
-
-private
-  def parse_api_json(body)
+    url = "https://public-api.secure.pixiv.net/v#{API_VERSION}/works/#{illust_id.to_i}.json"
+    resp = HTTParty.get(url, Danbooru.config.httparty_options.deep_merge(query: params, headers: headers))
+    body = resp.body.force_encoding("utf-8")
     json = JSON.parse(body)
 
-    if json["status"] != "success"
-      raise Error.new("Pixiv API call failed (status=#{json['status']} body=#{body})")
+    if resp.success?
+      WorksResponse.new(json["response"][0])
+    elsif json["status"] == "failure" && json.dig("errors", "system", "message") =~ /対象のイラストは見つかりませんでした。/
+      raise BadIDError.new("Pixiv ##{illust_id} not found: work was deleted, made private, or ID is invalid.")
+    else
+      raise Error.new("Pixiv API call failed (status=#{resp.code} body=#{body})")
     end
-
-    json
+  rescue JSON::ParserError
+    raise Error.new("Pixiv API call failed (status=#{resp.code} body=#{body})")
   end
 
   def access_token
@@ -157,17 +171,16 @@ private
         "client_id" => CLIENT_ID,
         "client_secret" => CLIENT_SECRET
       }
-      url = URI.parse("https://oauth.secure.pixiv.net/auth/token")
+      url = "https://oauth.secure.pixiv.net/auth/token"
 
-      Net::HTTP.start(url.host, url.port, :use_ssl => true) do |http|
-        resp = http.request_post(url.request_uri, URI.encode_www_form(params), headers)
+      resp = HTTParty.post(url, Danbooru.config.httparty_options.deep_merge(body: params, headers: headers))
+      body = resp.body.force_encoding("utf-8")
 
-        if resp.is_a?(Net::HTTPSuccess)
-          json = JSON.parse(resp.body)
-          access_token = json["response"]["access_token"]
-        else
-          raise Error.new("Pixiv API access token call failed (status=#{resp.code} body=#{resp.body})")
-        end
+      if resp.success?
+        json = JSON.parse(body)
+        access_token = json["response"]["access_token"]
+      else
+        raise Error.new("Pixiv API access token call failed (status=#{resp.code} body=#{body})")
       end
 
       access_token

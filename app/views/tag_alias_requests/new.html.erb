@@ -1,5 +1,5 @@
-<div id="c-tag-aliases">
-  <div id="a-request-new">
+<div id="c-tag-alias-requests">
+  <div id="a-new">
     <h1>Tag Alias Request</h1>
 
     <%= error_messages_for :tag_alias_request %>
@@ -9,12 +9,12 @@
     <%= form_tag(tag_alias_request_path, :class => "simple_form") do %>
       <div class="input">
         <label>From</label>
-        <%= text_field "tag_alias_request", "antecedent_name" %>
+        <%= text_field "tag_alias_request", "antecedent_name", :data => { :autocomplete => "tag" } %>
       </div>
 
       <div class="input">
         <label>To</label>
-        <%= text_field "tag_alias_request", "consequent_name" %>
+        <%= text_field "tag_alias_request", "consequent_name", :data => { :autocomplete => "tag" } %>
       </div>
 
       <div class="input">
@@ -30,14 +30,14 @@
       </div>
 
       <div class="input">
-        <%= submit_tag "Submit", :data => { :disable_with => "Submitting..." } %>
+        <%= submit_tag "Submit" %>
         <%= dtext_preview_button "tag_alias_request", "reason" %>
       </div>
     <% end %>
-
-    <%= render "tag_aliases/secondary_links" %>
   </div>
 </div>
+
+<%= render "tag_aliases/secondary_links" %>
 
 <% content_for(:page_title) do %>
   Tag Alias Request - <%= Danbooru.config.app_name %>

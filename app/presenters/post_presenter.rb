@@ -1,9 +1,10 @@
 class PostPresenter < Presenter
   attr_reader :pool, :next_post_in_pool
+  delegate :tag_list_html, :split_tag_list_html, :inline_tag_list_html, :split_inline_tag_list_html, to: :tag_set_presenter
 
   def self.preview(post, options = {})
     if post.nil?
-      return "Expunged"
+      return "<em>none</em>".html_safe
     end
 
     if !options[:show_deleted] && post.is_deleted? && options[:tags] !~ /status:(?:all|any|deleted|banned)/ && !options[:raw]
@@ -21,7 +22,7 @@ class PostPresenter < Presenter
 
     path = options[:path_prefix] || "/posts"
 
-    html =  %{<article itemscope itemtype="http://schema.org/ImageObject" id="post_#{post.id}" class="#{preview_class(post, options[:pool])}" #{data_attributes(post)}>}
+    html =  %{<article itemscope itemtype="http://schema.org/ImageObject" id="post_#{post.id}" class="#{preview_class(post, options[:pool], options)}" #{data_attributes(post)}>}
     if options[:tags].present? && !CurrentUser.is_anonymous?
       tag_param = "?tags=#{CGI::escape(options[:tags])}"
     elsif options[:pool_id] || options[:pool]
@@ -32,7 +33,15 @@ class PostPresenter < Presenter
       tag_param = nil
     end
     html << %{<a href="#{path}/#{post.id}#{tag_param}">}
-    html << %{<img itemprop="thumbnailUrl" src="#{post.preview_file_url}" alt="#{h(post.tag_string)}">}
+
+    if options[:show_cropped] && post.has_cropped?
+      src = post.cropped_file_url
+    else
+      src = post.preview_file_url
+    end
+
+    tooltip = "#{post.tag_string} rating:#{post.rating} score:#{post.score}"
+    html << %{<img itemprop="thumbnailUrl" src="#{src}" title="#{h(tooltip)}" alt="#{h(post.tag_string)}">}
     html << %{</a>}
 
     if options[:pool]
@@ -43,9 +52,15 @@ class PostPresenter < Presenter
       html << %{</p>}
     end
 
+    if options[:similarity]
+      html << %{<p class="desc">}
+      html << "Similarity: #{options[:similarity].round}%"
+      html << %{</p>}
+    end
+
     if options[:size]
       html << %{<p class="desc">}
-      html << post.file_size.to_formatted_s(:human_size)
+      html << post.file_size.to_s(:human_size)
       html << " (#{post.image_width}x#{post.image_height})"
       html << %{</p>}
     end
@@ -54,8 +69,9 @@ class PostPresenter < Presenter
     html.html_safe
   end
 
-  def self.preview_class(post, description = nil)
+  def self.preview_class(post, description = nil, options = {})
     klass = "post-preview"
+    klass << " large-cropped" if post.has_cropped? && options[:show_cropped]
     klass << " pooled" if description
     klass << " post-status-pending" if post.is_pending?
     klass << " post-status-flagged" if post.is_flagged?
@@ -66,12 +82,11 @@ class PostPresenter < Presenter
   end
 
   def self.data_attributes(post)
-    %{
+    attributes = %{
       data-id="#{post.id}"
       data-has-sound="#{post.has_tag?('video_with_sound|flash_with_sound')}"
       data-tags="#{h(post.tag_string)}"
       data-pools="#{post.pool_string}"
-      data-uploader="#{h(post.uploader_name)}"
       data-approver-id="#{post.approver_id}"
       data-rating="#{post.rating}"
       data-width="#{post.image_width}"
@@ -83,16 +98,38 @@ class PostPresenter < Presenter
       data-views="#{post.view_count}"
       data-fav-count="#{post.fav_count}"
       data-pixiv-id="#{post.pixiv_id}"
-      data-md5="#{post.md5}"
       data-file-ext="#{post.file_ext}"
-      data-file-url="#{post.file_url}"
-      data-large-file-url="#{post.large_file_url}"
-      data-preview-file-url="#{post.preview_file_url}"
-    }.html_safe
+      data-source="#{h(post.source)}"
+      data-top-tagger="#{post.keeper_id}"
+      data-uploader-id="#{post.uploader_id}"
+      data-normalized-source="#{h(post.normalized_source)}"
+      data-is-favorited="#{post.favorited_by?(CurrentUser.user.id)}"
+    }
+
+    if CurrentUser.is_moderator?
+      attributes += %{
+        data-uploader="#{h(post.uploader_name)}"
+      }
+    end
+
+    if post.visible?
+      attributes += %{
+        data-md5="#{post.md5}"
+        data-file-url="#{post.file_url}"
+        data-large-file-url="#{post.large_file_url}"
+        data-preview-file-url="#{post.preview_file_url}"
+      }
+    end
+
+    attributes.html_safe
   end
 
   def initialize(post)
     @post = post
+  end
+
+  def tag_set_presenter
+    @tag_set_presenter ||= TagSetPresenter.new(@post.tag_array)
   end
 
   def preview_html
@@ -107,54 +144,39 @@ class PostPresenter < Presenter
     @post.humanized_essential_tag_string
   end
 
-  def categorized_tag_string
-    string = []
-
-    if @post.copyright_tags.any?
-      string << @post.copyright_tags.join(" ")
-    end
-
-    if @post.character_tags.any?
-      string << @post.character_tags.join(" ")
-    end
-
-    if @post.artist_tags.any?
-      string << @post.artist_tags.join(" ")
-    end
-
-    if @post.general_tags.any?
-      string << @post.general_tags.join(" ")
-    end
-
-    string.join(" \n")
+  def filename_for_download
+    "#{humanized_essential_tag_string} - #{@post.md5}.#{@post.file_ext}"
   end
 
-  def humanized_categorized_tag_string
+  def categorized_tag_groups
     string = []
 
-    if @post.copyright_tags.any?
-      string << @post.copyright_tags
+    TagCategory.categorized_list.each do |category|
+      if @post.typed_tags(category).any?
+        string << @post.typed_tags(category).join(" ")
+      end
     end
+    
+    string
+  end
 
-    if @post.character_tags.any?
-      string << @post.character_tags
-    end
+  def categorized_tag_string
+    categorized_tag_groups.join(" \n")
+  end
 
-    if @post.artist_tags.any?
-      string << @post.artist_tags
-    end
-
-    if @post.general_tags.any?
-      string << @post.general_tags
-    end
-
-    string.flatten.slice(0, 25).join(", ").tr("_", " ")
+  def safe_mode_message(template)
+    html = ["This image is unavailable on safe mode (#{Danbooru.config.app_name}). Go to "]
+    html << template.link_to("Danbooru", "https://danbooru.donmai.us") # XXX don't hardcode.
+    html << " or disable safe mode to view ("
+    html << template.link_to("learn more", template.wiki_pages_path(title: "help:user_settings"))
+    html << ")."
+    html.join.html_safe
   end
 
   def image_html(template)
-    return template.content_tag("p", "The artist requested removal of this image") if @post.is_banned? && !CurrentUser.user.is_gold?
-    return template.content_tag("p", template.link_to("You need a gold account to see this image.", template.new_user_upgrade_path)) if !Danbooru.config.can_user_see_post?(CurrentUser.user, @post)
-    return template.content_tag("p", "This image is unavailable") if !@post.visible?
+    return template.content_tag("p", "The artist requested removal of this image") if @post.banblocked?
+    return template.content_tag("p", template.link_to("You need a gold account to see this image.", template.new_user_upgrade_path)) if @post.levelblocked?
+    return template.content_tag("p", safe_mode_message(template)) if @post.safeblocked?
 
     if @post.is_flash?
       template.render("posts/partials/show/flash", :post => @post)
@@ -169,18 +191,14 @@ class PostPresenter < Presenter
     end
   end
 
-  def tag_list_html(template, options = {})
-    @tag_set_presenter ||= TagSetPresenter.new(@post.tag_array)
-    @tag_set_presenter.tag_list_html(template, options.merge(:show_extra_links => CurrentUser.user.is_gold?))
-  end
-
-  def split_tag_list_html(template, options = {})
-    @tag_set_presenter ||= TagSetPresenter.new(@post.tag_array)
-    @tag_set_presenter.split_tag_list_html(template, options.merge(:show_extra_links => CurrentUser.user.is_gold?))
-  end
-
   def has_nav_links?(template)
-    (CurrentUser.user.enable_sequential_post_navigation && template.params[:tags].present? && template.params[:tags] !~ /(?:^|\s)(?:order|ordfav|ordpool):/) || @post.pools.any? || @post.favorite_groups(active_id=template.params[:favgroup_id]).any?
+    has_sequential_navigation?(template.params) || @post.pools.undeleted.any? || @post.favorite_groups(active_id=template.params[:favgroup_id]).any?
+  end
+
+  def has_sequential_navigation?(params)
+    return false if params[:tags] =~ /(?:^|\s)(?:order|ordfav|ordpool):/i
+    return false if params[:pool_id].present? || params[:favgroup_id].present?
+    return CurrentUser.user.enable_sequential_post_navigation 
   end
 
   def post_footer_for_pool_html(template)
@@ -202,13 +220,13 @@ class PostPresenter < Presenter
       return if pool.nil?
       html += pool_link_html(template, pool, :include_rel => true)
 
-      other_pools = @post.pools.where("id <> ?", template.params[:pool_id]).series_first
+      other_pools = @post.pools.undeleted.where("id <> ?", template.params[:pool_id]).series_first
       other_pools.each do |other_pool|
         html += pool_link_html(template, other_pool)
       end
     else
       first = true
-      pools = @post.pools.series_first
+      pools = @post.pools.undeleted
       pools.each do |pool|
         if first && template.params[:tags].blank? && template.params[:favgroup_id].blank?
           html += pool_link_html(template, pool, :include_rel => true)

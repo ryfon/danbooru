@@ -1,4 +1,4 @@
-class ForumTopic < ActiveRecord::Base
+class ForumTopic < ApplicationRecord
   CATEGORIES = {
     0 => "General",
     1 => "Tags",
@@ -11,22 +11,22 @@ class ForumTopic < ActiveRecord::Base
     Admin: User::Levels::ADMIN,
   }
 
-  attr_accessible :title, :original_post_attributes, :category_id, :as => [:member, :builder, :gold, :platinum, :janitor, :moderator, :admin, :default]
-  attr_accessible :is_sticky, :is_locked, :is_deleted, :min_level, :as => [:admin, :moderator]
-  belongs_to :creator, :class_name => "User"
-  belongs_to :updater, :class_name => "User"
-  has_many :posts, lambda {order("forum_posts.id asc")}, :class_name => "ForumPost", :foreign_key => "topic_id", :dependent => :destroy
-  has_one :original_post, lambda {order("forum_posts.id asc")}, :class_name => "ForumPost", :foreign_key => "topic_id"
+  belongs_to_creator
+  belongs_to_updater
+  has_many :posts, -> {order("forum_posts.id asc")}, :class_name => "ForumPost", :foreign_key => "topic_id", :dependent => :destroy
+  has_one :original_post, -> {order("forum_posts.id asc")}, class_name: "ForumPost", foreign_key: "topic_id", inverse_of: :topic
   has_many :subscriptions, :class_name => "ForumSubscription"
-  before_validation :initialize_creator, :on => :create
-  before_validation :initialize_updater
   before_validation :initialize_is_deleted, :on => :create
   validates_presence_of :title, :creator_id
   validates_associated :original_post
   validates_inclusion_of :category_id, :in => CATEGORIES.keys
   validates_inclusion_of :min_level, :in => MIN_LEVELS.values
+  validates :title, :length => {:maximum => 255}
   accepts_nested_attributes_for :original_post
   after_update :update_orignal_post
+  after_save(:if => ->(rec) {rec.is_locked? && rec.saved_change_to_is_locked?}) do |rec|
+    ModAction.log("locked forum topic ##{id} (title: #{title})",:forum_topic_lock)
+  end
 
   module CategoryMethods
     extend ActiveSupport::Concern
@@ -67,9 +67,17 @@ class ForumTopic < ActiveRecord::Base
       where("min_level <= ?", CurrentUser.level)
     end
 
+    def sticky_first
+      order(is_sticky: :desc, updated_at: :desc)
+    end
+
+    def default_order
+      order(updated_at: :desc)
+    end
+
     def search(params)
-      q = permitted
-      return q if params.blank?
+      q = super
+      q = q.permitted
 
       if params[:mod_only].present?
         q = q.where("min_level >= ?", MIN_LEVELS[:Moderator])
@@ -87,6 +95,17 @@ class ForumTopic < ActiveRecord::Base
         q = q.where("title = ?", params[:title])
       end
 
+      q = q.attribute_matches(:is_sticky, params[:is_sticky])
+      q = q.attribute_matches(:is_locked, params[:is_locked])
+      q = q.attribute_matches(:is_deleted, params[:is_deleted])
+
+      case params[:order]
+      when "sticky"
+        q = q.sticky_first
+      else
+        q = q.apply_default_order(params)
+      end
+
       q
     end
   end
@@ -102,8 +121,8 @@ class ForumTopic < ActiveRecord::Base
       ForumTopicVisit.where("user_id = ? and forum_topic_id = ? and last_read_at >= ?", user.id, id, updated_at).exists?
     end
 
-    def mark_as_read!(user = nil)
-      user ||= CurrentUser.user
+    def mark_as_read!(user = CurrentUser.user)
+      return if user.is_anonymous?
       
       match = ForumTopicVisit.where(:user_id => user.id, :forum_topic_id => id).first
       if match
@@ -112,7 +131,7 @@ class ForumTopic < ActiveRecord::Base
         ForumTopicVisit.create(:user_id => user.id, :forum_topic_id => id, :last_read_at => updated_at)
       end
 
-      has_unread_topics = ForumTopic.active.where("forum_topics.updated_at >= ?", user.last_forum_read_at)
+      has_unread_topics = ForumTopic.permitted.active.where("forum_topics.updated_at >= ?", user.last_forum_read_at)
       .joins("left join forum_topic_visits on (forum_topic_visits.forum_topic_id = forum_topics.id and forum_topic_visits.user_id = #{user.id})")
       .where("(forum_topic_visits.id is null or forum_topic_visits.last_read_at < forum_topics.updated_at)")
       .exists?
@@ -142,16 +161,20 @@ class ForumTopic < ActiveRecord::Base
     user.level >= min_level
   end
 
+  def create_mod_action_for_delete
+    ModAction.log("deleted forum topic ##{id} (title: #{title})",:forum_topic_delete)
+  end
+
+  def create_mod_action_for_undelete
+    ModAction.log("undeleted forum topic ##{id} (title: #{title})",:forum_topic_undelete)
+  end
+
   def initialize_is_deleted
     self.is_deleted = false if is_deleted.nil?
   end
 
-  def initialize_creator
-    self.creator_id = CurrentUser.id
-  end
-
-  def initialize_updater
-    self.updater_id = CurrentUser.id
+  def page_for(post_id)
+    (posts.where("id < ?", post_id).count / Danbooru.config.posts_per_page.to_f).ceil
   end
 
   def last_page
@@ -185,11 +208,11 @@ class ForumTopic < ActiveRecord::Base
   end
 
   def delete!
-    update_attributes({:is_deleted => true}, :as => CurrentUser.role)
+    update(is_deleted: true)
   end
 
   def undelete!
-    update_attributes({:is_deleted => false}, :as => CurrentUser.role)
+    update(is_deleted: false)
   end
 
   def update_orignal_post

@@ -2,39 +2,49 @@ require 'test_helper'
 
 module Moderator
   module Post
-    class PostsControllerTest < ActionController::TestCase
+    class PostsControllerTest < ActionDispatch::IntegrationTest
       context "The moderator posts controller" do
         setup do
-          @admin = FactoryGirl.create(:admin_user)
-          CurrentUser.user = @admin
-          CurrentUser.ip_addr = "127.0.0.1"
-          @post = FactoryGirl.create(:post)
+          @admin = create(:admin_user)
+          travel_to(1.month.ago) do
+            @user = create(:gold_user)
+          end
+          
+          as_user do
+            @post = create(:post)
+          end
         end
 
         context "confirm_delete action" do
           should "render" do
-            get :confirm_delete, { id: @post.id }, { user_id: @admin.id }
+            get_auth confirm_delete_moderator_post_post_path(@post), @admin
             assert_response :success
           end
         end
 
         context "delete action" do
           should "render" do
-            post :delete, {:id => @post.id, :reason => "xxx", :format => "js", :commit => "Delete"}, {:user_id => @admin.id}
+            post_auth delete_moderator_post_post_path(@post), @admin, params: {:reason => "xxx", :format => "js", :commit => "Delete"}
             assert(@post.reload.is_deleted?)
           end
 
           should "work even if the deleter has flagged the post previously" do
-            PostFlag.create(:post => @post, :reason => "aaa", :is_resolved => false)
-            post :delete, {:id => @post.id, :reason => "xxx", :format => "js", :commit => "Delete"}, {:user_id => @admin.id}
+            as_user do
+              PostFlag.create(:post => @post, :reason => "aaa", :is_resolved => false)
+            end
+            post_auth delete_moderator_post_post_path(@post), @admin, params: {:reason => "xxx", :format => "js", :commit => "Delete"}
             assert(@post.reload.is_deleted?)
           end
         end
 
         context "undelete action" do
           should "render" do
-            @post.update(is_deleted: true)
-            post :undelete, {:id => @post.id, :format => "js"}, {:user_id => @admin.id}
+            as_user do
+              @post.update(is_deleted: true)
+            end
+            assert_difference(-> { PostApproval.count }, 1) do
+              post_auth undelete_moderator_post_post_path(@post), @admin, params: {:format => "js"}
+            end
 
             assert_response :success
             assert(!@post.reload.is_deleted?)
@@ -43,29 +53,41 @@ module Moderator
 
         context "confirm_move_favorites action" do
           should "render" do
-            get :confirm_move_favorites, { id: @post.id }, { user_id: @admin.id }
+            get_auth confirm_ban_moderator_post_post_path(@post), @admin
             assert_response :success
           end
         end
 
         context "move_favorites action" do
+          setup do
+            @admin = create(:admin_user)
+          end
+
           should "render" do
-            parent = FactoryGirl.create(:post)
-            child = FactoryGirl.create(:post, parent: parent)
-            users = FactoryGirl.create_list(:user, 2)
-            users.each { |u| child.add_favorite!(u) }
+            as_user do
+              @parent = create(:post)
+              @child = create(:post, parent: @parent)
+            end
+            users = FactoryBot.create_list(:user, 2)
+            users.each do |u| 
+              @child.add_favorite!(u)
+              @child.reload
+            end
 
-            put :move_favorites, { id: child.id, commit: "Submit" }, { user_id: @admin.id }
-
-            assert_redirected_to(child)
-            assert_equal(users, parent.reload.favorited_users)
-            assert_equal([], child.reload.favorited_users)
+            post_auth move_favorites_moderator_post_post_path(@child.id), @admin, params: { commit: "Submit" }
+            assert_redirected_to(@child)
+            @parent.reload
+            @child.reload
+            as(@admin) do
+              assert_equal(users.map(&:id).sort, @parent.favorited_users.map(&:id).sort)
+              assert_equal([], @child.favorited_users.map(&:id))
+            end
           end
         end
 
         context "expunge action" do
           should "render" do
-            put :expunge, { id: @post.id, format: "js" }, { user_id: @admin.id }
+            post_auth expunge_moderator_post_post_path(@post), @admin, params: { format: "js" }
 
             assert_response :success
             assert_equal(false, ::Post.exists?(@post.id))
@@ -74,14 +96,14 @@ module Moderator
 
         context "confirm_ban action" do
           should "render" do
-            get :confirm_ban, { id: @post.id }, { user_id: @admin.id }
+            get_auth confirm_ban_moderator_post_post_path(@post), @admin
             assert_response :success
           end
         end
 
         context "ban action" do
           should "render" do
-            put :ban, { id: @post.id, commit: "Ban", format: "js" }, { user_id: @admin.id }
+            post_auth ban_moderator_post_post_path(@post), @admin, params: { commit: "Ban", format: "js" }
 
             assert_response :success
             assert_equal(true, @post.reload.is_banned?)
@@ -91,7 +113,7 @@ module Moderator
         context "unban action" do
           should "render" do
             @post.ban!
-            put :unban, { id: @post.id, format: "js" }, { user_id: @admin.id }
+            post_auth unban_moderator_post_post_path(@post), @admin, params: { format: "js" }
 
             assert_redirected_to(@post)
             assert_equal(false, @post.reload.is_banned?)

@@ -2,6 +2,8 @@
   <div id="a-index">
     <h1>Artist Commentary</h1>
 
+    <%= render "posts/partials/common/inline_blacklist" %>
+
     <table width="100%" class="striped">
       <thead>
         <tr>
@@ -17,13 +19,13 @@
             <td>
               <h3><%= h(commentary.original_title) %></h3>
               <div class="prose">
-                <%= format_text(commentary.original_description, :ragel => true) %>
+                <%= format_text(commentary.original_description, :disable_mentions => true) %>
               </div>
             </td>
             <td>
               <h3><%= h(commentary.translated_title) %></h3>
               <div class="prose">
-                <%= format_text(commentary.translated_description, :ragel => true) %>
+                <%= format_text(commentary.translated_description, :disable_mentions => true) %>
               </div>
             </td>
           </tr>
@@ -32,10 +34,10 @@
     </table>
 
     <%= numbered_paginator(@commentaries) %>
-
-    <%= render "secondary_links" %>
   </div>
 </div>
+
+<%= render "secondary_links" %>
 
 <% content_for(:page_title) do %>
   Artist Commentary - <%= Danbooru.config.app_name %>

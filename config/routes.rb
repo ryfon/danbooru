@@ -1,11 +1,9 @@
 Rails.application.routes.draw do
+
   namespace :admin do
     resources :users, :only => [:edit, :update]
     resource  :alias_and_implication_import, :only => [:new, :create]
     resource  :dashboard, :only => [:show]
-  end
-  namespace :mobile do
-    resources :posts, :only => [:index, :show]
   end
   namespace :moderator do
     resource :bulk_revert, :only => [:new, :create]
@@ -47,12 +45,12 @@ Rails.application.routes.draw do
     end
   end
   namespace :explore do
-    resources :posts do
+    resources :posts, :only => [] do
       collection do
         get :popular
+        get :viewed
         get :searches
         get :missed_searches
-        get :hot
         get :intro
       end
     end
@@ -109,15 +107,24 @@ Rails.application.routes.draw do
       get :posts
     end
   end
-  resources :delayed_jobs, :only => [:index]
+  resources :delayed_jobs, :only => [:index, :destroy] do
+    member do
+      put :run
+      put :retry
+      put :cancel
+    end
+  end
   resources :dmails, :only => [:new, :create, :index, :show, :destroy] do
+    member do
+      post :spam
+      post :ham
+    end
     collection do
-      get :search
       post :mark_all_as_read
     end
   end
   resource  :dtext_preview, :only => [:create]
-  resources :favorites
+  resources :favorites, :only => [:index, :create, :destroy]
   resources :favorite_groups do
     member do
       put :add_post
@@ -125,6 +132,7 @@ Rails.application.routes.draw do
     resource :order, :only => [:edit], :controller => "favorite_group_orders"
   end
   resources :forum_posts do
+    resource :votes, controller: "forum_post_votes"
     member do
       post :undelete
     end
@@ -146,7 +154,9 @@ Rails.application.routes.draw do
     resource :visit, :controller => "forum_topic_visits"
   end
   resources :ip_bans
-  resources :iqdb_queries, :only => [:create]
+  resource :iqdb_queries, :only => [:create, :show, :check] do
+    get :check
+  end
   resources :janitor_trials do
     collection do
       get :test
@@ -156,7 +166,6 @@ Rails.application.routes.draw do
       put :demote
     end
   end
-  resources :jobs
   resources :mod_actions
   resources :news_updates
   resources :notes do
@@ -189,8 +198,10 @@ Rails.application.routes.draw do
       get :diff
     end
   end
-  resources :posts do
+  resources :post_replacements, :only => [:index, :new, :create, :update]
+    resources :posts, :only => [:index, :show, :update] do
     resources :events, :only => [:index], :controller => "post_events"
+    resources :replacements, :only => [:index, :new, :create], :controller => "post_replacements"
     resource :artist_commentary, :only => [:index, :show] do
       collection { put :create_or_update }
       member { put :revert }
@@ -205,9 +216,11 @@ Rails.application.routes.draw do
       get :show_seq
       put :mark_as_translated
     end
+    get :similar, :to => "iqdb_queries#index"
   end
   resources :post_appeals
   resources :post_flags
+  resources :post_approvals, only: [:index]
   resources :post_versions, :only => [:index, :search] do
     member do
       put :undo
@@ -229,21 +242,22 @@ Rails.application.routes.draw do
   resource :related_tag, :only => [:show, :update]
   get "reports/uploads" => "reports#uploads"
   get "reports/similar_users" => "reports#similar_users"
+  get "reports/upload_tags" => "reports#upload_tags"
   get "reports/post_versions" => "reports#post_versions"
   post "reports/post_versions_create" => "reports#post_versions_create"
+  get "reports/down_voting_post" => "reports#down_voting_post"
+  post "reports/down_voting_post_create" => "reports#down_voting_post_create"
   resources :saved_searches, :except => [:show] do
     collection do
-      get :categories
+      get :labels
     end
   end
-  resource :saved_search_category_change, :only => [:new, :create]
   resource :session do
     collection do
       get :sign_out
     end
   end
   resource :source, :only => [:show]
-  resources :super_voters, :only => [:index]
   resources :tags do
     resource :correction, :only => [:new, :create, :show], :controller => "tag_corrections"
     collection do
@@ -263,12 +277,6 @@ Rails.application.routes.draw do
     end
   end
   resource :tag_implication_request, :only => [:new, :create]
-  resources :tag_subscriptions do
-    member do
-      post :migrate
-      get :posts
-    end
-  end
   resources :uploads do
     collection do
       get :batch
@@ -284,10 +292,6 @@ Rails.application.routes.draw do
     collection do
       get :search
       get :custom_style
-    end
-
-    member do
-      delete :cache
     end
   end
   resource :user_upgrade, :only => [:new, :create, :show]
@@ -322,8 +326,6 @@ Rails.application.routes.draw do
   resources :wpages, :controller => "wiki_pages"
   resources :ftopics, :controller => "forum_topics"
   resources :fposts, :controller => "forum_posts"
-  get "/m/posts", :controller => "mobile/posts", :action => "index"
-  get "/m/posts/:id", :controller => "mobile/posts", :action => "show"
 
   # legacy aliases
   get "/artist" => redirect {|params, req| "/artists?page=#{req.params[:page]}&search[name]=#{CGI::escape(req.params[:name].to_s)}"}

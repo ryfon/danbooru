@@ -1,25 +1,20 @@
 class SourcesController < ApplicationController
-  # before_filter :member_only
-  respond_to :json
+  respond_to :json, :xml
+  rescue_from Sources::Site::NoStrategyError, :with => :no_strategy
 
   def show
     @source = Sources::Site.new(params[:url], :referer_url => params[:ref])
     @source.get
 
-    respond_with(@source) do |format|
-      format.json do
-        render :json => @source.to_json
-      end
+    respond_with(@source.to_h) do |format|
+      format.xml { render xml: @source.to_h.to_xml(root: "source") }
+      format.json { render json: @source.to_h.to_json }
     end
   end
 
-private
+protected
 
-  def rescue_exception(exception)
-    respond_with do |format|
-      format.json do
-        render :json => {:message => exception.to_s, :backtrace => exception.backtrace}, :status => :error
-      end
-    end
+  def no_strategy
+    render json: {message: "Unsupported site"}.to_json, status: 400
   end
 end

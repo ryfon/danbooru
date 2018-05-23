@@ -1,35 +1,29 @@
 # todo: move this to iqdbs
 class IqdbQueriesController < ApplicationController
-  before_filter :member_only
+  respond_to :html, :json, :xml
 
-  def create
-    if !Danbooru.config.iqdbs_server
-      render :nothing => true
-      return
-    end
+  def show
+    @results = find_similar
 
-    if params[:url]
-      create_by_url
-    elsif params[:post_id]
-      create_by_post
-    else
-      render :nothing => true, :status => 422
+    respond_with(@results) do |fmt|
+      fmt.html { render :layout => false, :action => "create_by_url" }
+      fmt.js { render :layout => false, :action => "create_by_post" }
     end
   end
+
+  def check
+    @results = find_similar
+    respond_with(@results)
+  end
+
+  # Support both POST /iqdb_queries and GET /iqdb_queries.
+  alias_method :create, :show
 
 protected
-  def create_by_url
-    @download = Iqdb::Download.new(params[:url])
-    @download.find_similar
-    @results = @download.matches
-    render :layout => false, :action => "create_by_url"
-  end
+  def find_similar
+    return [] if params[:url].blank? && params[:post_id].blank?
 
-  def create_by_post
-    @post = Post.find(params[:post_id])
-    @download = Iqdb::Download.new(@post.complete_preview_file_url)
-    @download.find_similar
-    @results = @download.matches
-    render :layout => false, :action => "create_by_post"
+    params[:url] = Post.find(params[:post_id]).preview_file_url if params[:post_id].present?
+    Iqdb::Download.find_similar(params[:url])
   end
 end

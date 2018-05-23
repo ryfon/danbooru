@@ -21,6 +21,11 @@ module Sources
         assert_equal("osamari", @site_2.artist_name)
       end
 
+      should "get the artist commentary" do
+        assert_equal("コジコジ", @site_2.artist_commentary_title)
+        assert_equal("コジコジのドット絵\nこんなかわいらしい容姿で毒を吐くコジコジが堪らん（切実）", @site_2.artist_commentary_desc)
+      end
+
       should "get the image url" do
         assert_match(/^http:\/\/lohas\.nicoseiga\.jp\/priv\//, @site_1.image_url)
         assert_match(/^http:\/\/lohas\.nicoseiga\.jp\/priv\//, @site_2.image_url)
@@ -38,11 +43,19 @@ module Sources
 
       should "convert a page into a json representation" do
         assert_nothing_raised do
-          @site_1.to_json
+          @site_1.to_h
         end
         assert_nothing_raised do
-          @site_2.to_json
+          @site_2.to_h
         end
+      end
+
+      should "work for a https://lohas.nicoseiga.jp/thumb/${id}i url" do
+        site = Sources::Site.new("https://lohas.nicoseiga.jp/thumb/6844226i")
+        site.get
+
+        full_image_url = %r!https?://lohas.nicoseiga.jp/priv/[a-f0-9]{40}/[0-9]+/6844226!
+        assert_match(full_image_url, site.image_url)
       end
     end
   end

@@ -9,9 +9,13 @@ class StaticController < ApplicationController
   end
 
   def not_found
-    render text: "not found", status: :not_found
+    render plain: "not found", status: :not_found
   end
 
   def error
   end
+
+  def site_map
+  end
+  
 end

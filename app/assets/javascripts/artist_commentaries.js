@@ -73,10 +73,10 @@
       var commentary = Danbooru.ArtistCommentary.from_post_id(id);
     }
 
-    commentary.then(Danbooru.ArtistCommentary.fill_commentary).done(function (success) {
+    commentary.then(Danbooru.ArtistCommentary.fill_commentary).then(function (success) {
       var message = success ? "Artist commentary copied." : "Artist commentary copied; conflicting fields ignored.";
       Danbooru.notice(message);
-    }).fail(function () {
+    }).catch(function () {
       Danbooru.notice("Fetching artist commentary failed.");
     });
 
@@ -86,8 +86,8 @@
   Danbooru.ArtistCommentary.from_source = function(source) {
     return $.get("/source.json?url=" + encodeURIComponent(source)).then(function(data) {
       return {
-        original_title: data.artist_commentary.title,
-        original_description: data.artist_commentary.description,
+        original_title: data.artist_commentary.dtext_title,
+        original_description: data.artist_commentary.dtext_description,
         source: source,
       };
     });
@@ -115,14 +115,19 @@
   // If the new description conflicts with the current description, merge them
   // by appending the new description onto the old one.
   Danbooru.ArtistCommentary.merge_commentaries = function(description, commentary) {
+    var post_source = $('#image-container').data().source;
+    var normalized_source = $("#image-container").data().normalizedSource;
+
     if ((commentary.original_description && description) &&
         (commentary.original_description != description)) {
       return description
-        + "\n\n[tn]\nSource: " + $("#post_source").val() + "\n[/tn]"
+        + "\n\n[tn]\nSource: " + normalized_source + "\n[/tn]"
         + "\n\nh6. " + (commentary.original_title || "Untitled")
         + "\n\n" + commentary.original_description
         + "\n\n[tn]\nSource: " + commentary.source + "\n[/tn]";
-    } else  {
+    } else if (commentary.source != post_source) {
+      return commentary.original_description + "\n\n[tn]\nSource: " + commentary.source + "\n[/tn]";
+    } else {
       return commentary.original_description || description;
     }
   };

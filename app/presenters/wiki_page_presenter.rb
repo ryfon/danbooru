@@ -9,26 +9,6 @@ class WikiPagePresenter
     wiki_page.body
   end
 
-  def blurb
-    DText.strip(excerpt.to_s)
-  end
-
-  def consequent_tag_aliases
-    @consequent_tag_aliases ||= TagAlias.where("status in ('active', 'processing') and consequent_name = ?", wiki_page.title)
-  end
-
-  def antecedent_tag_alias
-    @antecedent_tag_alias ||= TagAlias.where("status in ('active', 'processing') and antecedent_name = ?", wiki_page.title).first
-  end
-
-  def consequent_tag_implications
-    @consequent_tag_implications ||= TagImplication.where("status in ('active', 'processing') and consequent_name = ?", wiki_page.title)
-  end
-
-  def antecedent_tag_implications
-    @antecedent_tag_implications ||= TagImplication.where("status in ('active', 'processing') and antecedent_name = ?", wiki_page.title)
-  end
-
   # Produce a formatted page that shows the difference between two versions of a page.
   def diff(other_version)
     pattern = Regexp.new('(?:<.+?>)|(?:[0-9_A-Za-z\x80-\xff]+[\x09\x20]?)|(?:[ \t]+)|(?:\r?\n)|(?:.+?)')
@@ -39,7 +19,7 @@ class WikiPagePresenter
     cbo = Diff::LCS::ContextDiffCallbacks.new
     diffs = thisarr.diff(otharr, cbo)
 
-    escape_html = lambda {|str| str.gsub(/&/,'&amp;').gsub(/</,'&lt;').gsub(/>/,'&gt;')}
+    escape_html = ->(str) {str.gsub(/&/,'&amp;').gsub(/</,'&lt;').gsub(/>/,'&gt;')}
 
     output = thisarr;
     output.each { |q| q.replace(CGI.escape_html(q)) }

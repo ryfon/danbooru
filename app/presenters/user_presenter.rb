@@ -44,63 +44,27 @@ class UserPresenter
   end
 
   def posts_for_saved_search_category(category)
-    if !SavedSearch.enabled?
-      return Post.where("false")
-    end
-
-    ids = SavedSearch.post_ids(CurrentUser.user.id, category)
-
-    if ids.any?
-      arel = Post.where("id in (?)", ids.map(&:to_i)).order("id desc").limit(10)
-
-      if CurrentUser.user.hide_deleted_posts?
-        arel = arel.undeleted
-      end
-
-      arel
-    else
-      Post.where("false")
-    end
+    Post.tag_match("search:#{category}").limit(10)
   end
 
-  def posts_for_subscription(subscription)
-    arel = Post.where("id in (?)", subscription.post_id_array.map(&:to_i)).order("id desc").limit(6)
-
-    if CurrentUser.user.hide_deleted_posts?
-      arel = arel.undeleted
-    end
-
-    arel
-  end
-
-  def tag_links_for_subscription(template, subscription)
-    subscription.tag_query_array.map {|x| template.link_to(x, template.posts_path(:tags => x))}.join(", ").html_safe
-  end
-
-  def upload_limit
+  def upload_limit(template)
     if user.can_upload_free?
       return "none"
     end
 
-    dcon = [user.deletion_confidence(60), 15].min
-    multiplier = (1 - (dcon / 15.0))
-    max_count = [(user.base_upload_limit * multiplier).ceil, 5].max
-    uploaded_count = Post.for_user(user.id).where("created_at >= ?", 24.hours.ago).count
-    uploaded_comic_count = Post.for_user(user.id).tag_match("comic").where("created_at >= ?", 24.hours.ago).count / 3
+    slots_tooltip = "Next free slot: #{template.time_ago_in_words(user.next_free_upload_slot)}"
+    limit_tooltip = <<-EOS.strip_heredoc
+      Base: #{user.base_upload_limit}
+      Del. Rate: #{"%.2f" % user.adjusted_deletion_confidence}
+      Multiplier: (1 - (#{"%.2f" % user.adjusted_deletion_confidence} / 15)) = #{user.upload_limit_multiplier}
+      Upload Limit: #{user.base_upload_limit} * #{"%.2f" % user.upload_limit_multiplier} = #{user.max_upload_limit}
+    EOS
 
-    "(#{user.base_upload_limit} * #{'%0.2f' % multiplier}) - #{uploaded_count - uploaded_comic_count} = #{user.upload_limit}"
+    %{<abbr title="#{slots_tooltip}">#{user.used_upload_slots}</abbr> / <abbr title="#{limit_tooltip}">#{user.max_upload_limit}</abbr>}.html_safe
   end
 
   def uploads
-    @uploads ||= begin
-      arel = Post.where("uploader_id = ?", user.id).order("id desc").limit(6)
-
-      if CurrentUser.user.hide_deleted_posts?
-        arel = arel.undeleted
-      end
-
-      arel
-    end
+    Post.tag_match("user:#{user.name}").limit(6)
   end
 
   def has_uploads?
@@ -108,15 +72,7 @@ class UserPresenter
   end
 
   def favorites
-    @favorites ||= begin
-      arel = user.favorites.limit(6).joins(:post).reorder("favorites.id desc")
-
-      if CurrentUser.user.hide_deleted_posts?
-        arel = arel.where("posts.is_deleted = false")
-      end
-
-      arel.map(&:post).compact
-    end
+    Post.tag_match("ordfav:#{user.name}").limit(6)
   end
 
   def has_favorites?
@@ -144,8 +100,8 @@ class UserPresenter
   end
 
   def commented_posts_count(template)
-    count = CurrentUser.without_safe_mode { Post.fast_count("commenter:#{user.name} order:comment") }
-    template.link_to(count, template.posts_path(:tags => "commenter:#{user.name} order:comment"))
+    count = CurrentUser.without_safe_mode { Post.fast_count("commenter:#{user.name}") }
+    template.link_to(count, template.posts_path(:tags => "commenter:#{user.name} order:comment_bumped"))
   end
 
   def post_version_count(template)
@@ -157,7 +113,7 @@ class UserPresenter
   end
 
   def noted_posts_count(template)
-    count = CurrentUser.without_safe_mode { Post.fast_count("noteupdater:#{user.name} order:note") }
+    count = CurrentUser.without_safe_mode { Post.fast_count("noteupdater:#{user.name}") }
     template.link_to(count, template.posts_path(:tags => "noteupdater:#{user.name} order:note"))
   end
 
@@ -213,17 +169,9 @@ class UserPresenter
     template.link_to("positive:#{positive} neutral:#{neutral} negative:#{negative}", template.user_feedbacks_path(:search => {:user_id => user.id}))
   end
 
-  def subscriptions
+  def saved_search_labels
     if CurrentUser.user.id == user.id
-      user.subscriptions
-    else
-      user.subscriptions.select {|x| x.is_public?}
-    end
-  end
-
-  def saved_search_categories
-    if CurrentUser.user.id == user.id
-      user.unique_saved_search_categories
+      SavedSearch.labels_for(CurrentUser.user.id)
     else
       []
     end
